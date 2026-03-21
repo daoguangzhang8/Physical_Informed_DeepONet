@@ -1,0 +1,14 @@
+# 数据与模型权重
+*.npy
+*.mat
+*.h5
+*.pth
+*.pt
+output/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 操作系统缓存
+.DS_Store
