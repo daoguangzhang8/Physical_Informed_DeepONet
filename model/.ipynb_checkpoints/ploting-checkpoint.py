@@ -202,10 +202,15 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
     loss_r_log = []
     loss_op_batch = []
     
-    # --- 新增：用于追踪最佳模型的变量 ---
+    # --- 用于追踪最佳模型的变量 ---
     best_loss = float('inf')
     best_model_state = None
     # -----------------------------------
+
+    # --- 新增：记录微调开始时间 ---
+    start_time = time.time()
+    print(f" 开始在目标速度场上执行域适应微调 (总迭代次数: {NIter})...")
+    # ------------------------------
 
     model_ft.train()
     with torch.no_grad():
@@ -217,21 +222,24 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
             y_batch = batch[0].to(device)
             y_batch = y_batch.unsqueeze(0)
             
-            # 计算损失：单卡直接调用model.loss（无需.module）
+            # 计算损失
             loss, loss_f, loss_u, loss_r = model_ft.loss(
                 vel.to(device), y_batch, UU0.to(device), labels_fno.to(device), 
                 a, b, c, data_norm_coe, pde_norm_coe
             )
             loss_op = c * model_ft.loss_op(model0, vel.to(device), y_batch, UU0.to(device))
             loss = loss + loss_op
-            loss / args.accumulation_steps
+            
+            # 修复：将除以累加步数后的结果重新赋值给 loss，否则梯度会按原比例回传
+            loss = loss / args.accumulation_steps 
+            
             # 反向传播
-            # optimizer.zero_grad()
             loss.backward()
-            # optimizer.step()
+            
             if (i + 1) % args.accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad() # 更新完后清空梯度
+                
             batch_loss.append(loss.item())
             loss_u_log.append(loss_u.item())
             loss_f_log.append(loss_f.item())
@@ -246,15 +254,12 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
         # 计算当前 Epoch 的平均总损失
         current_epoch_loss = np.mean(batch_loss)
         
-        # --- 新增：评估并保存最佳模型 ---
-        # 注意：由于 first_flag 会在第一个 epoch 后大幅改变 loss 的量级（受归一化系数影响），
-        # 建议从第二个 epoch (i > 0) 开始评估最佳模型，以保证评价标准的一致性。
+        # 评估并保存最佳模型
         if i > 0 and current_epoch_loss < best_loss:
             best_loss = current_epoch_loss
             # 仅保存 state_dict，避免显存泄漏和深拷贝带来的开销
             best_model_state = copy.deepcopy(model_ft.state_dict())
             print(f"微调 {i}/{NIter} --> 发现最佳模型! 当前总损失: {best_loss:.6f}")
-        # -----------------------------------
 
         print(f"微调 {i}/{NIter}, PDE损失: {np.mean(loss_f_log)/(args.batch_size * args.batch_size_v * 2):.6f}, 数据损失: {np.mean(loss_u_log)/(args.batch_size * args.batch_size_v * 2):.6f}, 锚定损失:{np.mean(loss_op_batch)/(args.batch_size * args.batch_size_v * 2):.6f}")
         
@@ -263,12 +268,19 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
         loss_r_log = []
         loss_op_batch = []
 
-    # --- 新增：循环结束后，加载最佳权重并返回 ---
+    # --- 新增：计算并格式化总耗时 ---
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    hours, rem = divmod(elapsed_time, 3600)
+    minutes, seconds = divmod(rem, 60)
+    # ------------------------------
+
     if best_model_state is not None:
-        print(f"\n微调结束。正在加载历史最佳模型权重 (最低损失: {best_loss:.6f}) 用于后续测试与绘图...")
+        print(f"\n 微调结束。总耗时: {int(hours)}小时 {int(minutes)}分钟 {seconds:.2f}秒")
+        print(f"正在加载历史最佳模型权重 (最低损失: {best_loss:.6f}) 用于后续测试与绘图...")
         model_ft.load_state_dict(best_model_state)
     else:
-        print("\n警告：未找到最佳模型（可能是迭代次数过少），将返回最终模型。")
-    # ---------------------------------------------
+        print("\n 警告：未找到最佳模型（可能是迭代次数过少），将返回最终模型。")
+        print(f"总耗时: {int(hours)}小时 {int(minutes)}分钟 {seconds:.2f}秒")
     
     return model_ft

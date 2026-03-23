@@ -24,11 +24,12 @@ def train(args):
                 )
                 ext_val_sets[name] = {"loader": loader, "plot_data": p_data}
         
-        
+        print(device)
         model = Pi_DeepONet(args).to(device)
+        print(model.device)
         
         fno = FNO(args).to(device)
-        fno.load_state_dict(torch.load('FNO_PI_model_8000epoch_weights.pth')['model_state_dict'])
+        fno.load_state_dict(torch.load('FNO_bad_PI_model_200epoch_weights.pth')['model_state_dict'])
         
         model._init_weights()  
         
@@ -38,7 +39,7 @@ def train(args):
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=args.factor, patience=args.factor, min_lr=args.min_lr
+            optimizer, mode='min', factor=args.factor, patience=args.patience, min_lr=args.min_lr
         )
 
         warmup_scheduler = WarmupScheduler(
@@ -76,7 +77,7 @@ def train(args):
                 # b = 1
                 decay_times = i // args.adjust_every 
                 a = a * args.adjust_speed ** (- decay_times)
-                a = max(a, 1e-2)
+                a = max(a, 2e-1)
                 b = 1
                 c = 0
             # print(f"迭代次数: {i}")
@@ -226,7 +227,7 @@ def train(args):
                 plt.legend()
                 plt.savefig(args.save_doc + '/loss_curve.png')
                 plt.close()
-                if i % (args.save_fig_every * 20) == 0 and i >= 0 and args.if_finetune:
+                if i % (args.save_fig_every * 20) == 0 and i > 0 and args.if_finetune:
                     test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test,'FT_Marmousi', True)
                 
                 test_plot(args, model, fno, i, dataloader["pred"], vel_pred, UU0_pred, labels_pred,'valid_without_fine_tune', False)

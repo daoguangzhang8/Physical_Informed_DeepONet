@@ -23,6 +23,8 @@ class Pi_DeepONet(nn.Module):
         self.attengate = AttenGate(use_softmax=True)
         self.combinedlayer1 = GaussianWeightedLayer(self.feat_dim)
         self.combinedlayer2 = GaussianWeightedLayer(self.feat_dim)
+        self.channel_attention1 = ChannelAttention(self.feat_dim, reduction=8)
+        self.channel_attention2 = ChannelAttention(self.feat_dim, reduction=8)
         self.data_norm_coe = 1.
         self.pde_norm_coe = 1.
         self.pde_real_k = 0.
@@ -31,22 +33,6 @@ class Pi_DeepONet(nn.Module):
         self.log_var_data = nn.Parameter(torch.zeros(1))
         self.log_var_pde = nn.Parameter(torch.zeros(1))
         
-        # self.cross_attn_layer = StandardCrossAttention(
-        #     d_model=self.feat_dim, 
-        #     num_heads=self.num_heads,
-        #     dim_feedforward=self.feat_dim * 3 # 保持标准 Transformer 4x 膨胀率
-        # )
-        # self.self_attn_encoder = nn.Sequential(*[
-        #     StandardEncoderLayer(
-        #         d_model=self.feat_dim,
-        #         num_heads=self.num_heads,
-        #         dim_feedforward=self.feat_dim * 2
-        #     ) for _ in range(1) # 例如，使用两层自注意力
-        # ])
-        # self.branch1_tokenizer = Tokenizer(self.feat_dim, target_size=8) 
-        # self.branch2_tokenizer = Tokenizer(self.feat_dim, target_size=8)
-
-        # self.Fourier_base = IntegerFourierTrunk(self.feat_dim)
         self.b2 = args.batch_size
 
         self.branch1 = nn.Sequential(
@@ -132,9 +118,7 @@ class Pi_DeepONet(nn.Module):
         x_encoded = self.pos_encoder(x_normlized)
         y_encoded = torch.cat([z_encoded, x_encoded], dim=2) # [B_v, B_pts, 16]
         y_fencoded = self.fencoder(y_normlized)
-        vel_mean = torch.mean(vel, dim=[2, 3]).view(b1,-1) # [b1, 1, 1, 1]
-        vel_std = torch.std(vel, dim=[2, 3]).view(b1,-1)  # [b1, 1, 1, 1]
-        physical_context = get_local_physical_features(vel, y, eps=1e-3)
+
 
         # print('physical_context', physical_context.shape)# vel_feature = vel_std * 1.5 + vel_mean
         # vel_feature = vel_feature.unsqueeze(1).expand(-1,b_pts,-1)
@@ -154,11 +138,12 @@ class Pi_DeepONet(nn.Module):
         # 原始 FNO 输出: [B_v, feat_dim*2, H, W]
         B1_raw = self.branch1(vel)
         B2_raw = self.branch2(UU0)
+        B1_raw = self.channel_attention1(B1_raw)
+        B2_raw = self.channel_attention1(B2_raw)
         B1_feat = self.combinedlayer1(vel, y[0], B1_raw)
         B2_feat = self.combinedlayer2(vel, y[0], B2_raw, False)
         
         B = self.attengate(B1_feat, B2_feat)
-        # B_encoded = self.block_feature_encoder(B1_raw + B2_raw, y_normlized)
         B_encoded = self.smooth_feature_encoder(B1_raw + B2_raw, y_normlized)
         
         T_raw = self.trunk(y_encoded, B_encoded)
@@ -176,7 +161,36 @@ class Pi_DeepONet(nn.Module):
         loss_u = self.loss_function(pred, labels)
 
         return loss_u
-    
+    def dynamic_barrier_loss(self, error, r0=8, lambda_aux=1.0):
+        """
+        带动态自适应系数的流形屏障惩罚函数。
+        在安全区 (r0) 内部，牵引力系数连续衰减，在圆心处严格为 0。
+        
+        Args:
+            error: 外部传入的绝对误差张量 (shape: [Batch, ...])
+            r0: 流形安全区半径 (死区阈值)
+            lambda_barrier: 越界惩罚系数 (越界时产生巨大的拉回梯度)
+            lambda_aux: 安全区边界处的最大辅助系数
+            
+        Returns:
+            total_loss: 标量 Tensor
+        """
+        # 1. 构造动态系数: 在 0 到 r0 之间线性增长，超过 r0 截断为 1.0
+        # 注意：防止除以 0，给分母加一个极小值
+        x = torch.clamp(error / (r0 + 1e-8), min=0.0, max=1.0)
+        
+        # 2. 核心数学修正：使用严格下凸函数 x^p
+        # 当 x=1 时，值为 1；当 x 稍微小于 1 时，值迅速下降
+        dynamic_coeff = lambda_aux * (x ** 2)
+        
+        # 3. 动态辅助损失
+        # 此时内部 Loss 相当于 error^(p+2)，极其平缓的盆底！
+        aux_loss = dynamic_coeff * error
+        
+        # 4. 组合总损失
+        total_loss = aux_loss
+        
+        return total_loss
     def loss_PDE_Scatter_pml(self, vel, y, UU0):
         y.requires_grad_(True)
 
@@ -490,6 +504,45 @@ class Pi_DeepONet(nn.Module):
             
         y_ran = torch.stack(y_ran_list, dim=0) # [B_v, num_pts, 2]
         return y_ran.requires_grad_(True)
+    def envelope_barrier_loss(self, vel, y, UU0, u_fno, lambda_env=1.0):
+        """
+        计算波场包络的流形屏障惩罚损失 (Envelope Barrier Loss)。
+        利用 FNO 锁定宏观能量分布，消除高频相位错位带来的局部非凸性。
+        
+        Args:
+            u_pred: DeepONet 预测的波场，形状 [B_v, B_pts, 2] (最后一维为实部和虚部)
+            u_fno: FNO 预测的引导波场，形状 [B_v, B_pts, 2]
+            r0: 流形容忍半径 (死区阈值)。
+                - 只有当包络误差大于 r0 时，才会产生拉回梯度。
+                - 在 r0 内部，Loss 为 0，完全交给 PDE 去雕刻高频相位。
+                - 如果设为 0，则退化为纯粹的包络 MSE 引导。
+            lambda_env: 损失权重系数。
+            
+        Returns:
+            loss_env: 标量 Tensor
+        """
+        u_pred = self.forward(vel, y, UU0)
+        # 1. 提取实部和虚部
+        u_pred_real = u_pred[..., 0]
+        u_pred_imag = u_pred[..., 1]
+        
+        u_fno_real = u_fno[..., 0]
+        u_fno_imag = u_fno[..., 1]
+        
+        # 2. 计算波场包络 (振幅)
+        # ⚠️ 极度重要：必须加上 1e-8，否则当波场能量为 0 时，sqrt 的导数会变成无穷大 (NaN)
+        env_pred = torch.sqrt(u_pred_real**2 + u_pred_imag**2 + 1e-8)
+        env_fno = torch.sqrt(u_fno_real**2 + u_fno_imag**2 + 1e-8)
+        
+        # 3. 计算逐点的包络绝对误差
+        # env_error shape: [B_v, B_pts]
+        loss_env = torch.abs(env_pred - env_fno)
+        
+        # 4. 应用流形屏障 (Barrier / Dead-zone)
+        # F.relu 会将所有小于 0 的值截断为 0，完美实现流形内部无 FNO 梯度的构想
+        
+        return torch.mean(loss_env)
+        
     def loss(self, vel, y, UU0, labels, a, b, c, data_norm_coe=1., pde_norm_coe=1.):
         
         batch_size_v = vel.shape[0]
@@ -512,18 +565,13 @@ class Pi_DeepONet(nn.Module):
         # 如果采样后维度顺序不对，可以用 .permute() 调整
         labels = sampled_labels # 已经是 [B_v, B_pts, 2]
         # print('labels',labels.shape)
-        # if first_flag:
-        #     args.data_norm_coe = self.loss_BC(vel, y, UU0, labels).item()
-        #     args.pde_norm_coe = self.loss_PDE_Scatter_pml(vel, y, UU0).item()
-            # loss_u = self.loss_BC(vel, y, UU0, labels)/ self.data_norm_coe
-            # # PDE损失
-        
-            # # loss_f = self.Sobolev_loss(vel, y, UU0)
-            # loss_f = self.loss_PDE_Scatter_pml(vel, y, UU0)/ self.pde_norm_coe
         # -------------------------- 1. 计算基础损失 --------------------------
         # 数据损失（BC损失）
         loss_u = self.loss_BC(vel, y, UU0, labels)/ data_norm_coe
+        # error = self.loss_BC(vel, y, UU0, labels)
+        # loss_u = self.dynamic_barrier_loss(error, r0=8, lambda_aux=1.0)/ data_norm_coe
         # PDE损失
+        # loss_env = self.envelope_barrier_loss(vel, y, UU0, labels)/ data_norm_coe
         
         # loss_f = self.Sobolev_loss(vel, y, UU0)
         loss_f = self.loss_PDE_Scatter_pml(vel, y, UU0)/ pde_norm_coe
@@ -541,36 +589,7 @@ class Pi_DeepONet(nn.Module):
         # balanced_loss = (precision_data * loss_u + self.log_var_data) + \
         #                 (precision_pde * loss_f + self.log_var_pde) + loss_ortho
         # 融合动态权重与原有系数a、b（a和b可作为基础比例系数）
-        loss_val = 1 * a * loss_u + b * 1 * (loss_f + loss_f_ran)
+        loss_val = 1 * a * (loss_u) + b * 1 * (loss_f + loss_f_ran)
 
         return loss_val, loss_f + loss_f_ran, loss_u, loss_r
-        
-    def loss_valid(self, vel, y, UU0, labels, a, b, c, data_norm_coe=1., pde_norm_coe=1.):
-        
-        batch_size_v = vel.shape[0]
-        nz = vel.shape[2]
-        nx = vel.shape[3]
-        
-        batch_idx = torch.arange(batch_size_v, device=labels.device)[:, None] # [B_v, 1]
-        z_coord = (y[:, :, 0] / 40.0).long().clamp(0, nz - 1) # [B_v, B_pts]
-        x_coord = (y[:, :, 1] / 40.0).long().clamp(0, nx - 1) # [B_v, B_pts]
-        
-        sampled_labels = labels[batch_idx, :, z_coord, x_coord] 
-        labels = sampled_labels # 已经是 [B_v, B_pts, 2]
-        loss_u = self.loss_BC(vel, y, UU0, labels)/ data_norm_coe
-        # PDE损失
-        
-        # loss_f = self.Sobolev_loss(vel, y, UU0)
-        loss_f = self.loss_PDE_Scatter_pml_valid(vel, y, UU0)/ pde_norm_coe
-
-        loss_r = 0.0
-
-        # 融合动态权重与原有系数a、b（a和b可作为基础比例系数）
-        loss_val = 1 * a * loss_u + b * 1 * (loss_f)
-        precision_data = torch.exp(-self.log_var_data)
-        precision_pde = torch.exp(-self.log_var_pde)
-        
-        balanced_loss = (precision_data * loss_u + self.log_var_data) + \
-                        (precision_pde * loss_f + self.log_var_pde)
-        return balanced_loss, loss_f, loss_u, loss_r
 

@@ -4,13 +4,13 @@ class Args:
     # ==========================================
     load_path = '/home/sharedata/zdg'         # 数据集加载根目录
     weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
-    save_doc = 'output'                       # 结果输出文件夹名称
+    save_doc = 'output2'                       # 结果输出文件夹名称
     filename = 'PI_DeepONet_pde'              # 保存的模型前缀名称
     
     # 外部泛化测试集配置 (支持动态扩展)
     ext_val_datasets = {
         'Marmousi': {'prefix': 'marmousi_', 'loc_target': 2},
-        # 'BP': {'prefix': 'bp_', 'loc_target': 0},  # 方便随时扩展
+        # 'BP': {'prefix': 'bp_', 'loc_target': 0},  
     }
     
     # ==========================================
@@ -56,14 +56,14 @@ class Args:
     nx = 70                                   # 物理模型 x 方向网格数 (不含外延 PML)
     nz = 70                                   # 物理模型 z 方向网格数 (不含外延 PML)
     pml = True                                # 是否启用 PML (Perfectly Matched Layer, 完美匹配层) 吸收边界
-    Lpml = 9                                  # 实际截取的 PML 层数
+    Lpml = 5                                  # 实际截取的 PML 层数
     LD = 10 - Lpml                            # 边界补偿计算参数 (用于适配原始数据与网络输入维度)
     
     # ==========================================
     # 7. 微调与域适应配置 (Fine-Tuning for Out-of-Distribution)
     # ==========================================
     if_finetune = True                        # 是否在外部复杂地层 (如 Marmousi) 上进行微调评估
-    ft_NIter = 10                             # 微调阶段的迭代步数
+    ft_NIter = 200                             # 微调阶段的迭代步数
     ft_lr = 2e-5                              # 微调阶段的专属学习率
     ft_a = 0.2                                # 微调阶段的数据 Loss 权重
     ft_b = 1                                  # 微调阶段的 PDE Loss 权重
@@ -80,7 +80,7 @@ class Args:
     # ==========================================
     # 9. 物理信息损失函数权重 (PINN Loss Coefficients)
     # ==========================================
-    a = 2                                     # coefficient of dataloss (数据拟合项权重)
+    a = 1                                     # coefficient of dataloss (数据拟合项权重)
     b = 1                                     # coefficient of pdeloss (PDE 物理残差项权重)
     c = 0                                     # coefficient of regularization loss (额外正则化项权重)
     

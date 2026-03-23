@@ -495,34 +495,6 @@ class FiLMTrunk(nn.Module):
         x = self.fc4(x)
         return x # 输出 128 维基底
 
-class IntegerFourierTrunk(nn.Module):
-    def __init__(self, feat_dim=128):
-        super().__init__()
-        self.num_freqs = feat_dim // 2
-        
-        n = torch.arange(8)
-        m = torch.arange(8)
-        grid_n, grid_m = torch.meshgrid(n, m, indexing='ij')
-        initial_freqs = torch.stack([grid_n.flatten(), grid_m.flatten()], dim=1).float()
-        
-        self.raw_freqs = nn.Parameter(initial_freqs)
-
-    def forward(self, y_grid):
-        B_v, B_pts, _ = y_grid.shape
-
-        # 确保使用整数频率进行前向计算，同时保留实数梯度的回传
-        freqs_int = torch.round(torch.abs(self.raw_freqs)) 
-        freqs = self.raw_freqs + (freqs_int - self.raw_freqs).detach() # [64, 2]
-
-        angles = 2 * torch.pi * torch.matmul(y_grid, freqs.t())
-        
-        t_sin = torch.sin(angles) # [B_v, B_pts, 64]
-        t_cos = torch.cos(angles) # [B_v, B_pts, 64]
-        
-        T_raw = torch.cat([t_sin, t_cos], dim=-1) * (2.0**0.5)
-        
-        return T_raw   
-
 class BlockFeatureEncoder(nn.Module):
     def __init__(self, in_channels, out_channels, grid_size=8):
         super().__init__()
