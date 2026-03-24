@@ -29,7 +29,7 @@ class FNO(nn.Module):
         self.log_var_pde = nn.Parameter(torch.zeros(1))
         
         self.FNO = nn.Sequential(
-            FNO2d(input_shape_branch1[1] + input_shape_branch2[1], 2, 12, 12, 32),
+            FNO2d(input_shape_branch1[1] + input_shape_branch2[1], 2, 16, 16, 128),
             # nn.Dropout2d(0.1),
         )
         

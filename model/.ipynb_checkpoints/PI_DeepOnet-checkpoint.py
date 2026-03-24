@@ -191,6 +191,7 @@ class Pi_DeepONet(nn.Module):
         total_loss = aux_loss
         
         return total_loss
+        
     def loss_PDE_Scatter_pml(self, vel, y, UU0):
         y.requires_grad_(True)
 

@@ -72,7 +72,7 @@ def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
     plt.savefig(args.save_doc + '/singleline.png', bbox_inches='tight')
     plt.close(figure1)  # 关闭画布，释放内存
     
-def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_fine_tune):
+def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_fine_tune, loc=2):
     if if_fine_tune:
         model = fine_tuning(args, model, fno, dataloader_y, vel, UU0, labels)
     model.eval()
@@ -80,7 +80,7 @@ def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_
     L = args.LD
     # filename = args.filename
     u_pred = []
-
+    
     with torch.no_grad():
         for batch in dataloader_y:
             y_batch = batch[0].to(device)

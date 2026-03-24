@@ -4,7 +4,7 @@ class Args:
     # ==========================================
     load_path = '/home/sharedata/zdg'         # 数据集加载根目录
     weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
-    save_doc = 'output2'                       # 结果输出文件夹名称
+    save_doc = 'output1'                       # 结果输出文件夹名称
     filename = 'PI_DeepONet_pde'              # 保存的模型前缀名称
     
     # 外部泛化测试集配置 (支持动态扩展)
@@ -22,7 +22,7 @@ class Args:
     # 3. 学习率调度器参数 (Learning Rate Scheduler)
     # ==========================================
     factor = 0.9                              # 学习率衰减因子 (ReduceLROnPlateau)
-    patience = 20                             # 触发衰减的容忍 epoch 数量
+    patience = 30                             # 触发衰减的容忍 epoch 数量
     min_lr = 1e-7                             # 允许的最小学习率
     
     # ==========================================
@@ -34,14 +34,14 @@ class Args:
     adjust_every = 1000                       # 每隔多少个 epoch 调整一次权重
     adjust_speed = 1.1                        # 权重衰减/增长的速度因子
     save_fig_every = 50                       # 每隔多少个 epoch 保存一次验证/测试可视化图片
-    save_model_every = 500                    # 每隔多少个 epoch 保存一次模型权重文件
+    save_model_every = 1000                    # 每隔多少个 epoch 保存一次模型权重文件
     
     # ==========================================
     # 5. 数据集与批处理配置 (Dataset & Dataloader)
     # ==========================================
-    nvel_train = 1                            # 训练所用的速度模型数量
+    nvel_train = 1                          # 训练所用的速度模型数量
     ny_train = 4900                           # 训练集空间采样点总数
-    batch_size = 800                          # Trunk Net 坐标采样批次大小 (num_sample)
+    batch_size = 700                          # Trunk Net 坐标采样批次大小 (num_sample)
     batch_size_v = 1                          # Branch Net 速度场/背景场批次大小 (Batch_v)
     
     valid_rate = 0.1                          # 验证集划分比例
@@ -49,21 +49,22 @@ class Args:
     valid_batch_size = 350                    # 验证集坐标采样批次大小
     valid_batch_size_v = 6                    # 验证集速度场批次大小
     accumulation_steps = 2                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
-    
+
+    source_list = [0, 1, 2, 3, 4]
     # ==========================================
     # 6. 物理网格与边界条件 (Physical Grid & PML Boundaries)
     # ==========================================
     nx = 70                                   # 物理模型 x 方向网格数 (不含外延 PML)
     nz = 70                                   # 物理模型 z 方向网格数 (不含外延 PML)
     pml = True                                # 是否启用 PML (Perfectly Matched Layer, 完美匹配层) 吸收边界
-    Lpml = 5                                  # 实际截取的 PML 层数
+    Lpml = 9                                  # 实际截取的 PML 层数
     LD = 10 - Lpml                            # 边界补偿计算参数 (用于适配原始数据与网络输入维度)
     
     # ==========================================
     # 7. 微调与域适应配置 (Fine-Tuning for Out-of-Distribution)
     # ==========================================
     if_finetune = True                        # 是否在外部复杂地层 (如 Marmousi) 上进行微调评估
-    ft_NIter = 200                             # 微调阶段的迭代步数
+    ft_NIter = 1000                             # 微调阶段的迭代步数
     ft_lr = 2e-5                              # 微调阶段的专属学习率
     ft_a = 0.2                                # 微调阶段的数据 Loss 权重
     ft_b = 1                                  # 微调阶段的 PDE Loss 权重

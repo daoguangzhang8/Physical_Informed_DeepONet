@@ -23,7 +23,7 @@ def Training_data(args, loc, vel, UU_loc, UU0_loc):
         [Lpml//2 + 1, Lpml//2 + 5], [Lpml//2 + 1, Lpml//2 + 20], [Lpml//2 + 1, Lpml//2 + 35], 
         [Lpml//2 + 1, Lpml//2 + 50], [Lpml//2 + 1, Lpml//2 + 65]
     ]
-    loc_list = [2] # 保持原样只取索引为2的波源
+    loc_list = args.source_list # 保持原样只取索引为2的波源
     
     # --- 核心处理逻辑封装（避免重复代码） ---
     def process_split(indices, count):

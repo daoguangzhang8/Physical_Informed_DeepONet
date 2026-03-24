@@ -29,7 +29,7 @@ def train(args):
         print(model.device)
         
         fno = FNO(args).to(device)
-        fno.load_state_dict(torch.load('FNO_bad_PI_model_200epoch_weights.pth')['model_state_dict'])
+        fno.load_state_dict(torch.load('FNO_PI_model_8000epoch_weights.pth', map_location=device)['model_state_dict'])
         
         model._init_weights()  
         
@@ -92,9 +92,9 @@ def train(args):
                 # 数据移到设备
                 vel_batch = vel_batch.to(device)
                 UU0_batch = UU0_batch.to(device)
-                # labels_batch = labels_batch.to(device)
-                with torch.no_grad():
-                    labels_batch = fno(vel_batch, UU0_batch).to(device)
+                labels_batch = labels_batch.to(device)
+                # with torch.no_grad():
+                    # labels_batch = fno(vel_batch, UU0_batch).to(device)
                 for batch in dataloader['train_y']:
                     y_batch = batch[0].to(device)
                     y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
