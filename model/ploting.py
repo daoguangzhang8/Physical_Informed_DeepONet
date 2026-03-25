@@ -71,7 +71,54 @@ def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
     plt.tight_layout()  # 防止标签被截断
     plt.savefig(args.save_doc + '/singleline.png', bbox_inches='tight')
     plt.close(figure1)  # 关闭画布，释放内存
+
+
+
+def plot_loss(epoch, save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss):
+    """
+    绘制并保存训练和验证的损失曲线
+    """
+    train_loss_lenth = len(loss_data_log)
+    valid_loss_lenth = len(valid_u_loss)
     
+    # 构建 X 轴，确保与当前 epoch 对应
+    train_x_axis = np.linspace(0, epoch, num=train_loss_lenth, endpoint=True)
+    valid_x_axis = np.linspace(0, epoch, num=valid_loss_lenth, endpoint=True)
+    
+    # 确保保存路径存在 (可选防护)
+    os.makedirs(save_doc, exist_ok=True)
+
+    # 1. 绘制 Data Loss 曲线
+    plt.figure()
+    plt.plot(train_x_axis, loss_data_log, label="Training Data Loss")
+    plt.plot(valid_x_axis, valid_u_loss, label="Valid Data Loss")
+    plt.yscale('log')
+    plt.legend()
+    plt.title(f'epoch {epoch} Data Loss')
+    plt.savefig(f"{save_doc}/Dataloss_curve.png")
+    plt.close()
+
+    # 2. 绘制 PDE Loss 曲线
+    plt.figure()
+    plt.plot(train_x_axis, loss_pde_log, label="Training PDE Loss")
+    plt.plot(valid_x_axis, valid_f_loss, label="Valid PDE Loss")
+    plt.yscale('log')
+    plt.legend()
+    plt.title(f'epoch {epoch} PDE Loss')
+    plt.savefig(f"{save_doc}/PDEloss_curve.png")
+    plt.close()
+
+    # 3. 绘制 Total Loss 曲线
+    plt.figure()
+    plt.plot(loss_log, label="Total Loss")
+    plt.yscale('log')
+    plt.legend()
+    plt.title(f'epoch {epoch} Total Loss')
+    plt.savefig(f"{save_doc}/loss_curve.png")
+    plt.close()
+
+
+
 def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_fine_tune, loc=2):
     if if_fine_tune:
         model = fine_tuning(args, model, fno, dataloader_y, vel, UU0, labels)
@@ -165,7 +212,7 @@ def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_
     plt.imshow(err_abs_real, aspect='auto', cmap='bwr')
     plt.xlabel('X')
     plt.ylabel('Z')
-    plt.title(f'epoch {i} valid real error')
+    plt.title(f'epoch {i} {filename} real error')
     plt.colorbar()
     plt.clim(-eRr, eRr)
 
@@ -173,7 +220,7 @@ def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_
     plt.imshow(err_abs_imag, aspect='auto', cmap='bwr')
     plt.xlabel('X')
     plt.ylabel('Z')
-    plt.title(f'epoch {i} valid imag error')
+    plt.title(f'epoch {i} {filename} imag error')
     plt.colorbar()
     plt.clim(-eRi, eRi)
     plt.savefig(args.save_doc + '/error_' + f'{filename}.png')
