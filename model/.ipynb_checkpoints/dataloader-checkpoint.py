@@ -2,10 +2,10 @@ from Labconfig import *
 from model.utils import Halton_Sample
 
 
-def Training_data(args, loc, vel, UU_loc, UU0_loc):
+
+def Training_data(args, vel, UU_loc, UU0_loc):
     """
-    生成训练数据和验证数据
-    保持原逻辑：使用 Halton 采样生成坐标点，计算 UU - UU0 的残差标签
+    生成训练数据和验证数据（支持多震源并发训练）
     """
     # 1. 基本参数准备
     nvel, ny, Lpml = args.nvel_train, args.ny_train, args.Lpml
@@ -13,7 +13,7 @@ def Training_data(args, loc, vel, UU_loc, UU0_loc):
     nz, nx = vel.shape[1], vel.shape[2]
     valid_num = int(args.valid_rate * nvel) + 1
     
-    # 2. 索引随机筛选
+    # 2. 索引随机筛选 (划分训练集和验证集的速度模型)
     idx = np.random.choice(vel.shape[0], nvel, replace=False)
     selected_idx_set = set(idx)
     remaining_idx = [i for i in range(len(vel)) if i not in selected_idx_set]
@@ -23,46 +23,62 @@ def Training_data(args, loc, vel, UU_loc, UU0_loc):
         [Lpml//2 + 1, Lpml//2 + 5], [Lpml//2 + 1, Lpml//2 + 20], [Lpml//2 + 1, Lpml//2 + 35], 
         [Lpml//2 + 1, Lpml//2 + 50], [Lpml//2 + 1, Lpml//2 + 65]
     ]
-    loc_list = args.source_list # 保持原样只取索引为2的波源
+    loc_list = args.source_list  # 现在可以包含多个震源，例如 [1, 2, 3]
     
-    # --- 核心处理逻辑封装（避免重复代码） ---
+    # --- 核心处理逻辑封装（支持多震源数据拼接） ---
     def process_split(indices, count):
-        curr_vel = vel[indices[:count], :, :].unsqueeze(1) # [N, 1, NZ, NX]
+        # 提取当前划分的速度模型基础张量 [count, 1, NZ, NX]
+        base_vel = vel[indices[:count], :, :].unsqueeze(1) 
         
-        # 目前 loc_list 只有一个元素 [2]，直接取第一个即可，保持原循环逻辑兼容性
+        vel_list, u_list, u0_list, labels_list, src_list = [], [], [], [], []
+        
+        # 遍历所有被激活的震源
         for loci in loc_list:
-            # 提取对应的物理场数据
+            # 1. 速度模型对每个震源都是一样的，直接复制加入列表
+            vel_list.append(base_vel)
+            
+            # 2. 提取对应震源的物理场数据 [count, 2, NZ, NX]
             u_current = UU_loc[loci][indices[:count], :, :, :]
             u0_current = UU0_loc[loci][indices[:count], :, :, :]
             
-            # 计算标签 (UU - UU0)
+            # 3. 计算标签残差
             labels_current = u_current - u0_current
             
-            # 计算 Source 坐标并扩展维度
-            sz, sx = source_coords[loci]
-            src_tensor = torch.tensor([sz, sx]).expand(count * ny, -1).float()
+            u_list.append(u_current)
+            u0_list.append(u0_current)
+            labels_list.append(labels_current)
             
-        return curr_vel, u_current, u0_current, labels_current, src_tensor * spatial_step
+            # 4. 计算当前 Source 坐标并扩展维度 (适配当前 batch 大小 count)
+            sz, sx = source_coords[loci]
+            # 这里将维度扩展为 [count, 2]，代表这 count 个样本对应同一个震源坐标
+            src_tensor = torch.tensor([sz, sx]).expand(count, -1).float()
+            src_list.append(src_tensor * spatial_step)
+
+        # 沿 Batch 维度 (dim=0) 拼接所有震源的数据
+        # 最终的 Batch Size = count * len(loc_list)
+        vel_out = torch.cat(vel_list, dim=0)
+        u_out = torch.cat(u_list, dim=0)
+        u0_out = torch.cat(u0_list, dim=0)
+        labels_out = torch.cat(labels_list, dim=0)
+        src_out = torch.cat(src_list, dim=0)
+            
+        return vel_out, u_out, u0_out, labels_out, src_out
 
     # --- 3. 生成训练集数据 ---
     vel_train, UU_loc_train, UU0_train, labels, source_train = process_split(idx, nvel)
     
-    # 训练集的坐标点 y_train (使用全部网格平铺逻辑)
+    # 训练集的坐标点 y_train (使用全部网格平铺逻辑，所有样本共享一份即可节省内存)
     x_c = torch.arange(0, nx)
     z_c = torch.arange(0, nz)
-    grid_z, grid_x = torch.meshgrid(z_c, x_c, indexing='ij') # 明确指定索引方式
+    grid_z, grid_x = torch.meshgrid(z_c, x_c, indexing='ij') 
     y_train = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1).float() * spatial_step
 
     # --- 4. 生成验证集数据 ---
     vel_valid, UU_loc_valid, UU0_valid, labels_valid, source_valid = process_split(remaining_idx, valid_num)
+    y_valid = y_train  # 验证集坐标点与训练集保持一致
     
-    # 验证集的坐标点 y_valid (使用 Halton 采样逻辑)
-    # array_size = vel[0].shape
-    # train_points = torch.tensor(Halton_Sample(array_size, ny)).long()
-    # y_valid = torch.stack([train_points[:, 0], train_points[:, 1]], dim=1).float() * spatial_step
-    y_valid = y_train
-    
-    # return vel_train, UU_loc_train, UU0_train, y_train, labels, vel_valid, UU_loc_valid, UU0_valid, y_valid, labels_valid
+    # 注意：原代码的 return 中没有包含 source_train 和 source_valid。
+    # 如果您的 DeepONet 损失函数（或网络输入）需要动态震源坐标，请考虑在返回值中加入它们！
     return (
         vel_train, UU_loc_train, UU0_train, y_train, labels, 
         vel_valid, UU_loc_valid, UU0_valid, y_valid, labels_valid
@@ -155,8 +171,8 @@ def prepare_training_dataloaders(args, device):
     
     np.random.seed(1)
     vel_train, UU_loc_train, UU0_train, y_train, labels_train, \
-    vel_valid, UU_loc_valid, UU0_valid, y_valid, labels_valid = Training_data(args, 2, vel, UU_loc, UU0_loc)
-
+    vel_valid, UU_loc_valid, UU0_valid, y_valid, labels_valid = Training_data(args, vel, UU_loc, UU0_loc)
+    print('vel_train', vel_train.shape)
     # 4. 物理场归一化
     vel_train = vel_train / 1000.
     vel_valid = vel_valid / 1000.

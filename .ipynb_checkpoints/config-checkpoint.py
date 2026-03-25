@@ -41,7 +41,7 @@ class Args:
     # ==========================================
     nvel_train = 1                          # 训练所用的速度模型数量
     ny_train = 4900                           # 训练集空间采样点总数
-    batch_size = 700                          # Trunk Net 坐标采样批次大小 (num_sample)
+    batch_size = 800                          # Trunk Net 坐标采样批次大小 (num_sample)
     batch_size_v = 1                          # Branch Net 速度场/背景场批次大小 (Batch_v)
     
     valid_rate = 0.1                          # 验证集划分比例
