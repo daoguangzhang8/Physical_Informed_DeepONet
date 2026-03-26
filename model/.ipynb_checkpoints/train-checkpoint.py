@@ -167,22 +167,22 @@ def train(args):
                 model.eval()
                 batch_u_loss, batch_f_loss = [], [] 
                 
-                with torch.no_grad(): 
-                    for vel_batch, UU0_batch, labels_batch in dataloader['valid']:
-                        vel_batch = vel_batch.to(device)
-                        UU0_batch = UU0_batch.to(device)
-                        labels_batch = labels_batch.to(device)
+                 
+                for vel_batch, UU0_batch, labels_batch in dataloader['valid']:
+                    vel_batch = vel_batch.to(device)
+                    UU0_batch = UU0_batch.to(device)
+                    labels_batch = labels_batch.to(device)
+                    
+                    for batch in dataloader['valid_y']:
+                        y_batch = batch[0].to(device)
+                        y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
                         
-                        for batch in dataloader['valid_y']:
-                            y_batch = batch[0].to(device)
-                            y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
-                            
-                            _, loss_f_valid, loss_u_valid, _ = model.loss(
-                                vel_batch, y_batch, UU0_batch, labels_batch, 
-                                a, b, c, data_norm_coe, pde_norm_coe
-                            )
-                            batch_u_loss.append(loss_u_valid.item())
-                            batch_f_loss.append(loss_f_valid.item())
+                        _, loss_f_valid, loss_u_valid, _ = model.loss(
+                            vel_batch, y_batch, UU0_batch, labels_batch, 
+                            a, b, c, data_norm_coe, pde_norm_coe
+                        )
+                        batch_u_loss.append(loss_u_valid.item())
+                        batch_f_loss.append(loss_f_valid.item())
                             
                 valid_u_loss.append(np.mean(batch_u_loss))
                 valid_f_loss.append(np.mean(batch_f_loss)) 

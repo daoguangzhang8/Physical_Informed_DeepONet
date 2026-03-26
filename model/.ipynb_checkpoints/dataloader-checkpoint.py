@@ -83,58 +83,54 @@ def Training_data(args, vel, UU_loc, UU0_loc):
         vel_train, UU_loc_train, UU0_train, y_train, labels, 
         vel_valid, UU_loc_valid, UU0_valid, y_valid, labels_valid
     )
+
 def Test_data_single(args, loc_idx, vel_single, UU_loc_single, UU0_loc_single):
     """
-    专门用于加载单个测试模型（如 Marmousi）
-    逻辑完全对齐训练脚本中的 valid 生成逻辑：
-    1. 保持输入数据的维度一致
-    2. 使用 Halton 采样生成坐标点 y_test
-    3. 计算标签 labels = UU - UU0
+    专门用于加载测试模型（如 Marmousi），支持自适应单震源或多震源并发输入。
     """
     # 1. 基本参数准备
-    ny, Lpml = args.ny_train, args.Lpml
     spatial_step = 40
     nz, nx = vel_single.shape[-2], vel_single.shape[-1]
     
-    # 确保输入是 Tensor 且维度正确 [1, NZ, NX]
+    # 确保输入是 Tensor
     if isinstance(vel_single, np.ndarray):
         vel_single = torch.from_numpy(vel_single)
+    if isinstance(UU_loc_single, np.ndarray):
+        UU_loc_single = torch.from_numpy(UU_loc_single)
+    if isinstance(UU0_loc_single, np.ndarray):
+        UU0_loc_single = torch.from_numpy(UU0_loc_single)
+        
+    # ==========================================
+    # 核心修改点：自适应维度推导
+    # ==========================================
+    # 2. 提取波场数据，利用 -1 自动推导包含的震源数量 (num_sources)
+    u_current = UU_loc_single.view(-1, 2, nz, nx).float()
+    u0_current = UU0_loc_single.view(-1, 2, nz, nx).float()
     
-    # 2. 速度模型处理 (对齐 [1, 1, NZ, NX])
-    # 假设输入是 [NZ, NX]，增加 Batch 和 Channel 维度
-    vel_test = vel_single.view(1, 1, nz, nx).float()
+    num_sources = u_current.shape[0]  # 获取实际传进来的震源数量 (例如 1 或 5)
     
-    # 3. 提取指定波源位置的数据 (loc_idx 通常为 2)
-    # 假设 UU_loc_single 传入的是该波源下的 [2, NZ, NX] 或包含波源维度的字典/列表
-    u_current = UU_loc_single.view(1, 2, nz, nx).float()
-    u0_current = UU0_loc_single.view(1, 2, nz, nx).float()
+    # 3. 速度模型处理
+    # 速度模型本身只有 1 个，为了能放进 Dataloader，必须复制成 num_sources 份与波场对齐
+    vel_test = vel_single.view(1, 1, nz, nx).expand(num_sources, -1, -1, -1).float()
     
-    # 计算标签 (UU - UU0) -> [1, 2, NZ, NX]
+    # 4. 计算标签 (UU - UU0) -> [num_sources, 2, NZ, NX]
     labels_test = u_current - u0_current
     
-    # 4. 波源坐标处理
-    source_coords = [
-        [Lpml//2 + 1, Lpml//2 + 5], [Lpml//2 + 1, Lpml//2 + 20], [Lpml//2 + 1, Lpml//2 + 35], 
-        [Lpml//2 + 1, Lpml//2 + 50], [Lpml//2 + 1, Lpml//2 + 65]
-    ]
-    sz, sx = source_coords[loc_idx]
-    # 对齐 valid 逻辑，扩展为 [1 * ny, 2]
-    source_test = torch.tensor([sz, sx]).expand(1 * ny, -1).float() * spatial_step
-    
-    # 5. 坐标点采样 (严格对齐 valid 的 Halton 采样逻辑)
-    array_size = (nz, nx)
-    
-    # Halton_Sample 需在外部已定义
-    test_points = torch.tensor(Halton_Sample(array_size, ny)).long()
+    # ==========================================
+    # 坐标点采样
+    # ==========================================
+    # 生成全空间网格
     x_c = torch.arange(0, nx)
     z_c = torch.arange(0, nz)
-    grid_z, grid_x = torch.meshgrid(z_c, x_c, indexing='ij') # 明确指定索引方式
-    y_train = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1).float() * spatial_step
+    grid_z, grid_x = torch.meshgrid(z_c, x_c, indexing='ij') 
     
-    # 生成 y_test [ny, 2]
-    y_test = y_train
+    # 展平成 [NZ*NX, 2]
+    y_grid = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1).float() * spatial_step
+    
+    # 同样地，网格坐标也需要扩展成 num_sources 份，变成 [num_sources, NZ*NX, 2]
+    y_test = y_grid.unsqueeze(0).expand(num_sources, -1, -1)
+    
     # 返回参数顺序与原函数保持一致
-    # 这里的 _train 位置用 _test 代替，确保单模型输出
     return vel_test, u_current, u0_current, y_test, labels_test
 
 def load_tensor_from_npy(base_path, filename):
@@ -231,8 +227,19 @@ def prepare_external_val_dataset(args, prefix, loc_target, y_pred_grid):
 
     # 3. 截取目标震源位置
     num_samples = len(vel_ext) 
-    m_uu_single = UU_ext[loc_target * num_samples : (loc_target + 1) * num_samples]
-    m_uu0_single = UU0_ext[loc_target * num_samples : (loc_target + 1) * num_samples]
+    # m_uu_single = UU_ext[loc_target * num_samples : (loc_target + 1) * num_samples]
+    # m_uu0_single = UU0_ext[loc_target * num_samples : (loc_target + 1) * num_samples]
+    # 兼容 loc_target 是列表（多震源）或整数（单震源）的情况
+    if isinstance(loc_target, list):
+        m_uu_single = torch.cat([UU_ext[loc * num_samples : (loc + 1) * num_samples] for loc in loc_target], dim=0)
+        m_uu0_single = torch.cat([UU0_ext[loc * num_samples : (loc + 1) * num_samples] for loc in loc_target], dim=0)
+        
+        # 注意：如果你的速度场 v_ext 只有一份（形状如 [1, 1, Z, X]），
+        # 在拼接成 Dataloader 之前，可能需要将其按震源数量复制对齐：
+        # v_ext = v_ext.repeat(len(loc_target), 1, 1, 1) 
+    else:
+        m_uu_single = UU_ext[loc_target * num_samples : (loc_target + 1) * num_samples]
+        m_uu0_single = UU0_ext[loc_target * num_samples : (loc_target + 1) * num_samples]
 
     # 4. 生成测试格式数据
     v_test, u_test, u0_test, y_test, lab_test = Test_data_single(
@@ -253,3 +260,47 @@ def prepare_external_val_dataset(args, prefix, loc_target, y_pred_grid):
     
     print(f'External dataset [{prefix}] ready: vel_shape {v_test.shape}')
     return ext_loader, ext_plot_data
+
+# def extract_single_model_multi_source(args, vel_set, UU0_set, labels_set, target_model_idx=0):
+#     """
+#     从按震源顺序拼接的数据集中，提取出【指定索引】的一个速度模型及其对应的多震源波场数据。
+    
+#     Args:
+#         args: 全局参数，需包含 args.source_list (例如 [0, 1, 2, 3, 4])
+#         vel_set: 训练或验证集的速度场 Tensor [base_count * num_sources, 1, Z, X]
+#         UU0_set: 背景波场 Tensor [base_count * num_sources, 2, Z, X]
+#         labels_set: 真实标签 Tensor [base_count * num_sources, 2, Z, X]
+#         base_count: 该集合基础速度模型的数量 (train集为 nvel_train, valid集为 valid_num)
+#         target_model_idx: 指定要提取第几个速度模型 (0 <= target_model_idx < base_count)
+        
+#     Returns:
+#         model_data_pack (dict): 包含画图所需的 vel, UU0_list, labels_list
+#     """
+#     num_sources = len(args.source_list)
+#     base_count = num_sources // 5
+#     # 防止索引越界
+#     if target_model_idx >= base_count or target_model_idx < 0:
+#         raise ValueError(f"指定的索引 {target_model_idx} 超出范围，该集合只有 {base_count} 个基础模型。")
+    
+#     # 1. 提取指定索引的速度模型 (扩展出 batch=1 的维度 [1, 1, Z, X])
+#     vel_single = vel_set[target_model_idx].unsqueeze(0)
+    
+#     UU0_list = []
+#     labels_list = []
+    
+#     # 2. 跨块跳跃提取该模型在所有震源下的波场数据
+#     for s in range(num_sources):
+#         # 核心索引公式：指定模型索引 + 震源索引 * 基础模型数量
+#         target_idx = target_model_idx + s * base_count
+        
+#         UU0_list.append(UU0_set[target_idx].unsqueeze(0))      # [1, 2, Z, X]
+#         labels_list.append(labels_set[target_idx].unsqueeze(0)) # [1, Z, X, 2] 或其它对应维度
+        
+#     # 3. 组装返回
+#     model_data_pack = {
+#         "vel": vel_single,
+#         "UU0_list": UU0_list,
+#         "labels_list": labels_list
+#     }
+    
+#     return model_data_pack

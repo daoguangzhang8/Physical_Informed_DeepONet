@@ -4,7 +4,7 @@ class Args:
     # ==========================================
     load_path = '/home/sharedata/zdg'         # 数据集加载根目录
     weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
-    save_doc = 'output1'                       # 结果输出文件夹名称
+    save_doc = 'output3'                       # 结果输出文件夹名称
     filename = 'PI_DeepONet_pde'              # 保存的模型前缀名称
     
     # 外部泛化测试集配置 (支持动态扩展)
@@ -34,14 +34,14 @@ class Args:
     adjust_every = 1000                       # 每隔多少个 epoch 调整一次权重
     adjust_speed = 1.1                        # 权重衰减/增长的速度因子
     save_fig_every = 50                       # 每隔多少个 epoch 保存一次验证/测试可视化图片
-    save_model_every = 1000                    # 每隔多少个 epoch 保存一次模型权重文件
+    save_model_every = 500                    # 每隔多少个 epoch 保存一次模型权重文件
     
     # ==========================================
     # 5. 数据集与批处理配置 (Dataset & Dataloader)
     # ==========================================
     nvel_train = 1                          # 训练所用的速度模型数量
     ny_train = 4900                           # 训练集空间采样点总数
-    batch_size = 800                          # Trunk Net 坐标采样批次大小 (num_sample)
+    batch_size = 700                          # Trunk Net 坐标采样批次大小 (num_sample)
     batch_size_v = 1                          # Branch Net 速度场/背景场批次大小 (Batch_v)
     
     valid_rate = 0.1                          # 验证集划分比例
@@ -50,7 +50,7 @@ class Args:
     valid_batch_size_v = 6                    # 验证集速度场批次大小
     accumulation_steps = 2                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
 
-    source_list = [0, 1, 2, 3, 4]
+    source_list = [2]
     # ==========================================
     # 6. 物理网格与边界条件 (Physical Grid & PML Boundaries)
     # ==========================================
