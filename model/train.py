@@ -1,5 +1,9 @@
 import os
 import gc
+import numpy as np
+import torch
+from tqdm import tqdm
+
 from Labconfig import *
 from model.utils import *
 from model.dataloader import *
@@ -64,11 +68,15 @@ def train(args):
         data_norm_coe = 1.
 
         # ==========================================
-        # 4. 主训练循环
+        # 4. 主训练循环 (引入 tqdm 进度条与显存优化)
         # ==========================================
         optimizer.zero_grad()
-        for i in range(args.NIter):
-            
+        pbar = tqdm(range(args.NIter), desc="Training Progress", dynamic_ncols=True)
+        
+        # 新增：用于全局记录 Batch 步数，确保梯度累加逻辑正确
+        step_counter = 0  
+        
+        for i in pbar:
             # 动态调整损失权重 a
             if args.if_adjust and i > args.adjust_from and (i - args.adjust_from) % args.adjust_every == 0:
                 decay_times = i // args.adjust_every 
@@ -83,6 +91,7 @@ def train(args):
                 vel_batch, UU0_batch = vel_batch.to(device), UU0_batch.to(device)
                 
                 # 使用 FNO 动态生成 labels
+                # labels_batch = labels.to(device)
                 with torch.no_grad():
                     labels_batch = fno(vel_batch, UU0_batch).to(device)
                 
@@ -101,18 +110,23 @@ def train(args):
                     loss = loss / args.accumulation_steps
                     loss.backward()
                     
-                    if (i + 1) % args.accumulation_steps == 0:
+                    # 修复：使用 step_counter 而不是 epoch i 来判断是否更新梯度
+                    step_counter += 1  
+                    if step_counter % args.accumulation_steps == 0:
                         optimizer.step()
                         optimizer.zero_grad() 
                         
-                    # 记录未除以 accumulation_steps 的真实损失值
+                    # 记录真实损失值
                     batch_loss.append(loss.item() * args.accumulation_steps) 
                     batch_u_loss.append(loss_u.item())
                     batch_f_loss.append(loss_f.item())
                     batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
+                    
+                    # 新增：手动切断引用，立即释放该 sub-batch 的巨大计算图，极大降低显存占用
+                    del loss, loss_f, loss_u, loss_r, y_batch
 
             # ------------------------------------------
-            # 记录当前 Epoch 损失并输出日志
+            # 记录当前 Epoch 损失并更新进度条显示
             # ------------------------------------------
             avg_loss = np.mean(batch_loss) if batch_loss else 0
             
@@ -131,7 +145,14 @@ def train(args):
                 loss_reg_log.append(np.mean(batch_r_loss))
                 
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {i}/{args.NIter} | Total Loss: {avg_loss:.6f} | PDE Loss: {loss_pde_log[-1]:.6f} | Data Loss: {loss_data_log[-1]:.6f} | LR: {current_lr}")
+            
+            # 使用 pbar.set_postfix 将信息追加到进度条后方
+            pbar.set_postfix({
+                'Total': f"{avg_loss:.4e}",
+                'PDE': f"{loss_pde_log[-1]:.4e}",
+                'Data': f"{loss_data_log[-1]:.4e}",
+                'LR': f"{current_lr:.2e}"
+            })
 
             # 学习率调度
             if i <= args.warmup_epochs:
@@ -173,22 +194,21 @@ def train(args):
                 vel_pred, UU0_pred, labels_pred = plot_data["vel_pred"], plot_data["UU0_pred"], plot_data["labels_pred"]
                 vel_test, UU0_test, labels_test = plot_data["vel_test"], plot_data["UU0_test"], plot_data["labels_test"]
 
-                # 提取 Marmousi 外部验证集数据
                 marmousi_data = ext_val_sets['Marmousi']
                 v_m_test, u0_m_test, lab_m_test = marmousi_data["plot_data"]["v_test"], marmousi_data["plot_data"]["u0_test"], marmousi_data["plot_data"]["lab_test"]
                 dataloader_m_y_full = marmousi_data["loader"]
 
-                # 绘制 Loss 曲线 (调用之前的封装函数)
                 plot_loss(i, args.save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss)
                 
-                if i % (args.save_fig_every * 20) == 0 and i > 0 and args.if_finetune:
-                    test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'FT_Marmousi', if_fine_tune=True)
-                
-                test_plot(args, model, fno, i, dataloader["pred"], vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False)
-                test_plot(args, model, fno, i, dataloader["test"], vel_test, UU0_test, labels_test, 'train', if_fine_tune=False)
-                test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'Marmousi', if_fine_tune=False)
-
-                plot_sinlge(model, args, 6, vel_test, UU0_test, labels_test)
+                # 新增：防止绘图函数内部构建冗余计算图导致 OOM
+                with torch.no_grad(): 
+                    if i % (args.save_fig_every * 20) == 0 and i > 0 and args.if_finetune:
+                        test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'FT_Marmousi', if_fine_tune=True)
+                    
+                    test_plot(args, model, fno, i, dataloader["pred"], vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False)
+                    test_plot(args, model, fno, i, dataloader["test"], vel_test, UU0_test, labels_test, 'train', if_fine_tune=False)
+                    test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'Marmousi', if_fine_tune=False)
+                    plot_sinlge(model, args, 6, vel_test, UU0_test, labels_test)
 
                 torch.cuda.empty_cache()
                 gc.collect()
@@ -197,7 +217,7 @@ def train(args):
             # 7. 模型保存
             # ==========================================
             if i % args.save_model_every == 0 and i > 0:
-                print(f'>>> 保存 Checkpoint: Total Loss {loss_log[-1]:.6f} | PDE Loss {loss_pde_log[-1]:.6f} | Data Loss {loss_data_log[-1]:.6f}')
+                pbar.write(f'>>> Epoch {i} | 保存 Checkpoint: Total Loss {loss_log[-1]:.4e} | PDE Loss {loss_pde_log[-1]:.4e}')
                 
                 checkpoint = {
                     'model_state_dict': model.state_dict(),
