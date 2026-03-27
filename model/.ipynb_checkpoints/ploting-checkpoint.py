@@ -267,7 +267,7 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
         batch_loss = []
         for batch in dataloader_y:
             y_batch = batch[0].to(device)
-            y_batch = y_batch.unsqueeze(0)
+            y_batch = y_batch.unsqueeze(0).expand(vel.shape[0], -1, -1)
             
             # 计算损失
             loss, loss_f, loss_u, loss_r = model_ft.loss(

@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from model.utils import *
 from model.dataloader import *
 from model.PI_DeepOnet import Pi_DeepONet
+from model.FNO import FNO
 from model.ploting import *
 
 class Args_test:
@@ -21,11 +22,14 @@ class Args_test:
     weights_save_path = '/home/sharedata/zdg' 
     save_doc = 'output_test'                       
     filename = 'PI_DeepONet_pde'              
-    
+
+    source_list = [0, 1, 2, 3, 4]
     ext_val_datasets = {
-        'Marmousi': {'prefix': 'marmousi_', 'loc_target': [0, 1, 2, 3, 4]}, 
+        'Marmousi': {'prefix': 'marmousi_', 'loc_target': source_list}, 
+        '1994BP': {'prefix': '1994BP_', 'loc_target': source_list},
+        'SEAM': {'prefix': 'SEAM_', 'loc_target': source_list},
     }
-    
+    target_epoch = 1000
     # ==========================================
     # 2. 硬件与设备配置
     # ==========================================
@@ -52,7 +56,7 @@ class Args_test:
     # ==========================================
     # 5. 数据集与批处理配置
     # ==========================================
-    nvel_train = 1                         
+    nvel_train = 1500                         
     ny_train = 4900                           
     batch_size = 700                          
     batch_size_v = 1                           
@@ -63,7 +67,6 @@ class Args_test:
     valid_batch_size_v = 6                    
     accumulation_steps = 2                    
 
-    source_list = [0, 1, 2, 3, 4]
     
     # ==========================================
     # 6. 物理网格与边界条件
@@ -78,7 +81,7 @@ class Args_test:
     # 7. 微调与域适应配置
     # ==========================================
     if_finetune = True                        
-    ft_NIter = 1000                             
+    ft_NIter = 10                             
     ft_lr = 2e-5                              
     ft_a = 0.2                                
     ft_b = 1                                  
@@ -134,27 +137,55 @@ def extract_single_model_multi_source(args, vel_set, UU0_set, labels_set, base_c
         "labels_list": labels_list
     }
 
+
 import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset
 
-def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, y_full_grid, epoch, save_doc, filename_prefix="MultiSource"):
+def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, epoch, save_doc, filename_prefix="MultiSource", if_fine_tune=False, fno=None):
     """
-    针对单一速度模型，分别绘制实部和虚部的多震源波场预测对比图。
-    优化 1：引入分 Batch 预测逻辑，防止测试大网格时 OOM。
-    优化 2：调整 figsize 与 aspect='equal'，使子图呈现正方形。
+    带有自适应微调机制的多震源波场预测对比图绘制。
+    直接调用外部的 fine_tuning 函数，不对其做任何修改。
     """
-    model.eval()
     num_sources = len(UU0_list)
-    nz, nx = vel.shape[2], vel.shape[3]
+    device = vel.device
     
-    # 获取 PML 裁剪边界
+    # 动态生成专属的坐标网格 Dataloader
+    grid_nz, grid_nx = args.nz, args.nx 
+    x_coords, z_coords = torch.arange(0, grid_nx), torch.arange(0, grid_nz)
+    grid_z, grid_x = torch.meshgrid(z_coords, x_coords, indexing='ij')
+    points = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1)
+    y_full_grid = points.float() * 40  
+    
+    dataset_y = TensorDataset(y_full_grid)
+    dataloader_y = DataLoader(dataset_y, batch_size=args.batch_size, shuffle=False)
+    
+    # =====================================================
+    # 核心：执行微调逻辑 (调用你原封不动的 fine_tuning)
+    # =====================================================
+    if if_fine_tune:
+        print(f"\n[!] 触发域适应微调机制: 目标 -> {filename_prefix}")
+        # 将 list 拼接为 batch tensor 以便一次性输入微调函数
+        UU0_ft = torch.cat([u.unsqueeze(0) if u.dim() == 3 else u for u in UU0_list], dim=0).to(device)
+        labels_ft = torch.cat([l.unsqueeze(0) if l.dim() == 3 else l for l in labels_list], dim=0).to(device)
+        # 扩展 vel 以匹配震源数量的 batch size
+        vel_ft = vel.expand(UU0_ft.shape[0], -1, -1, -1).to(device)
+        
+        # 直接调用你的微调函数
+        eval_model = fine_tuning(args, model, fno, dataloader_y, vel_ft, UU0_ft, labels_ft)
+        
+        # 在文件名后缀追加 _FT (Fine-Tuned)
+        filename_prefix = f"{filename_prefix}_FT"
+    else:
+        eval_model = model  # 不微调，使用原模型
+        
+    eval_model.eval()
+    
     L = args.LD
     slc = slice(L, -L) if L > 0 else slice(None)
     
-    # === 修改这里：调整 figsize，让子图接近正方形 ===
-    # 宽度 = 3.5 * 震源数，高度 = 10 (适应 3 行的比例)
     fig_real, axes_real = plt.subplots(3, num_sources, figsize=(3.5 * num_sources, 10))
     fig_imag, axes_imag = plt.subplots(3, num_sources, figsize=(3.5 * num_sources, 10))
     
@@ -174,41 +205,37 @@ def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, 
             curr_UU0 = UU0_list[s_idx].unsqueeze(0) if UU0_list[s_idx].dim() == 3 else UU0_list[s_idx]
             curr_label = labels_list[s_idx]
             
-            # -----------------------------------------------------
-            # 核心优化：分 Batch 预测网格点，防止显存爆炸
-            # -----------------------------------------------------
             u_pred_list = []
-            print(' curr_UU0',  curr_UU0.shape)
-            # y_full_grid 的形状是 [1, B_pts, 2]，在 dim=1 上切分
-            for y_batch in torch.split(y_full_grid, args.valid_batch_size, dim=1):
-                # 推理当前的子网格
-                u_batch = model(vel, y_batch, curr_UU0)
+            for batch in dataloader_y:
+                y_batch = batch[0].to(device).unsqueeze(0)
+                # 使用 eval_model (微调后的 或 原版的)
+                u_batch = eval_model(vel, y_batch, curr_UU0)
                 u_pred_list.append(u_batch)
                 
-            # 将所有 batch 的预测结果在空间点维度拼回全图
             pred_concat = torch.cat(u_pred_list, dim=1)
-            pred_np = pred_concat[0].view(nz, nx, 2).cpu().numpy()
+            pred_np = pred_concat[0].view(grid_nz, grid_nx, 2).cpu().numpy()
             
-            # 提取预测值并裁掉 PML 边界
             pred_real = pred_np[slc, slc, 0]
             pred_imag = pred_np[slc, slc, 1]
             
-            # 兼容处理 Label 形状并提取真实值 (裁掉 PML)
-            if curr_label.dim() == 4:
-                if curr_label.shape[1] == 2: # [1, 2, Z, X]
-                    true_real = curr_label[0, 0, :, :].cpu().numpy()[slc, slc]
-                    true_imag = curr_label[0, 1, :, :].cpu().numpy()[slc, slc]
-                else: # [1, Z, X, 2]
-                    true_real = curr_label[0, :, :, 0].cpu().numpy()[slc, slc]
-                    true_imag = curr_label[0, :, :, 1].cpu().numpy()[slc, slc]
-            elif curr_label.dim() == 3 and curr_label.shape[-1] == 2:
-                true_real = curr_label[:, :, 0].cpu().numpy()[slc, slc]
-                true_imag = curr_label[:, :, 1].cpu().numpy()[slc, slc]
-            else:
-                true_real = curr_label[0, :, 0].view(nz, nx).cpu().numpy()[slc, slc]
-                true_imag = curr_label[0, :, 1].view(nz, nx).cpu().numpy()[slc, slc]
+            true_np = curr_label.squeeze().cpu().numpy() 
+            target_shape = pred_real.shape[0] 
             
-            # 计算原始残差与定量评估指标
+            if true_np.shape[0] == 2:
+                if true_np.shape[1] > target_shape: 
+                    true_real = true_np[0, slc, slc]
+                    true_imag = true_np[1, slc, slc]
+                else:
+                    true_real = true_np[0, :, :]
+                    true_imag = true_np[1, :, :]
+            else: 
+                if true_np.shape[0] > target_shape: 
+                    true_real = true_np[slc, slc, 0]
+                    true_imag = true_np[slc, slc, 1]
+                else:
+                    true_real = true_np[:, :, 0]
+                    true_imag = true_np[:, :, 1]
+            
             err_real = true_real - pred_real
             err_imag = true_imag - pred_imag
             
@@ -221,12 +248,10 @@ def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, 
             
             vmax_r, vmin_r = np.max(np.abs(true_real)), -np.max(np.abs(true_real))
             vmax_i, vmin_i = np.max(np.abs(true_imag)), -np.max(np.abs(true_imag))
-            
             eRr = np.max(np.abs(err_real))
             eRi = np.max(np.abs(err_imag))
             
-            # ================= [实部绘制 fig_real] =================
-            # 修改了 aspect='equal' 保证正方形
+            # 实部绘制
             ax = axes_real[0, s_idx]
             im = ax.imshow(true_real, cmap='seismic', aspect='equal', vmin=vmin_r, vmax=vmax_r)
             ax.set_title(f"Src {s_idx+1} True Real\nR²: {metrics_real['r2']:.4f}", fontsize=11)
@@ -245,7 +270,7 @@ def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, 
             ax.axis('off')
             fig_real.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             
-            # ================= [虚部绘制 fig_imag] =================
+            # 虚部绘制
             ax = axes_imag[0, s_idx]
             im = ax.imshow(true_imag, cmap='seismic', aspect='equal', vmin=vmin_i, vmax=vmax_i)
             ax.set_title(f"Src {s_idx+1} True Imag\nR²: {metrics_imag['r2']:.4f}", fontsize=11)
@@ -264,21 +289,14 @@ def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, 
             ax.axis('off')
             fig_imag.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             
-    # --- 调整布局并保存实部 ---
     fig_real.tight_layout(rect=[0, 0.03, 1, 0.95])
     os.makedirs(save_doc, exist_ok=True)
-    save_path_real = os.path.join(save_doc, f"{filename_prefix}_REAL_epoch_{epoch}.png")
-    fig_real.savefig(save_path_real, dpi=150, bbox_inches='tight') 
+    fig_real.savefig(os.path.join(save_doc, f"{filename_prefix}_REAL_epoch_{epoch}.png"), dpi=150, bbox_inches='tight') 
     plt.close(fig_real) 
     
-    # --- 调整布局并保存虚部 ---
     fig_imag.tight_layout(rect=[0, 0.03, 1, 0.95])
-    save_path_imag = os.path.join(save_doc, f"{filename_prefix}_IMAG_epoch_{epoch}.png")
-    fig_imag.savefig(save_path_imag, dpi=150, bbox_inches='tight') 
-    plt.close(fig_imag) 
-    
-    print(f"\n[+] 实部对比图已保存: {save_path_real}")
-    print(f"[+] 虚部对比图已保存: {save_path_imag}\n")
+    fig_imag.savefig(os.path.join(save_doc, f"{filename_prefix}_IMAG_epoch_{epoch}.png"), dpi=150, bbox_inches='tight') 
+    plt.close(fig_imag)
 
 # ==============================================================================
 # 核心测试流程 (完全去除 Dataloader 依赖的纯 Tensor 版本)
@@ -313,7 +331,7 @@ def test(args, target_epoch, custom_weights_path=None):
         np.random.seed(1)
         vel_train, UU_loc_train, UU0_train, y_train, labels_train, \
         vel_valid, UU_loc_valid, UU0_valid, y_valid, labels_valid = Training_data(args, vel, UU_loc, UU0_loc)
-        print('y_valid', y_valid.shape)
+        
         vel_train = vel_train / 1000.
         vel_valid = vel_valid / 1000.
         
@@ -325,11 +343,12 @@ def test(args, target_epoch, custom_weights_path=None):
         )
 
         # ---------------------------------------------------------
-        # 2. 外部测试集准备 (Marmousi, 提取纯 Tensor)
+        # 2. 外部测试集准备 (自适应提取所有的 External Set)
         # ---------------------------------------------------------
         ext_val_sets = {}
         if hasattr(args, 'ext_val_datasets'):
             for name, config in args.ext_val_datasets.items():
+                print(f"[*] 正在加载外部验证集: {name}...")
                 _, p_data = prepare_external_val_dataset(
                     args, 
                     prefix=config['prefix'], 
@@ -342,6 +361,10 @@ def test(args, target_epoch, custom_weights_path=None):
         # 3. 模型初始化与权重加载
         # ---------------------------------------------------------
         model = Pi_DeepONet(args).to(device)
+        
+        fno = FNO(args).to(device)
+        fno.load_state_dict(torch.load('FNO_PI_model_8000epoch_weights.pth', map_location=device)['model_state_dict'])
+        fno.eval() # FNO 仅作推断生成 labels，设为评估模式
         
         if custom_weights_path:
             model_path = custom_weights_path
@@ -369,7 +392,7 @@ def test(args, target_epoch, custom_weights_path=None):
             vel=valid_plot_data["vel"].to(device),
             UU0_list=[u.to(device) for u in valid_plot_data["UU0_list"]],
             labels_list=[l.to(device) for l in valid_plot_data["labels_list"]],
-            y_full_grid=y_grid_tensor,
+            # y_full_grid=y_grid_tensor,
             epoch=target_epoch,
             save_doc=args.save_doc,
             filename_prefix="Valid_Set_Model"
@@ -381,35 +404,41 @@ def test(args, target_epoch, custom_weights_path=None):
             vel=train_plot_data["vel"].to(device),
             UU0_list=[u.to(device) for u in train_plot_data["UU0_list"]],
             labels_list=[l.to(device) for l in train_plot_data["labels_list"]],
-            y_full_grid=y_grid_tensor,
+            # y_full_grid=y_grid_tensor,
             epoch=target_epoch,
             save_doc=args.save_doc,
             filename_prefix="Train_Set_Model"
         )
         
-        if 'Marmousi' in ext_val_sets:
-            mar_data = ext_val_sets['Marmousi']
-            v_m_test = mar_data["v_test"].to(device)   
-            u0_m_test = mar_data["u0_test"].to(device) 
-            lab_m_test = mar_data["lab_test"].to(device) 
-            
-            num_mar_sources = u0_m_test.shape[0]
-            mar_vel_single = v_m_test[0:1] 
-            
-            mar_UU0_list = [u0_m_test[i:i+1] for i in range(num_mar_sources)]
-            mar_labels_list = [lab_m_test[i:i+1] for i in range(num_mar_sources)]
-            
-            plot_single_velocity_multi_sources(
-                args,
-                model=model,
-                vel=mar_vel_single,
-                UU0_list=mar_UU0_list,
-                labels_list=mar_labels_list,
-                y_full_grid=y_grid_tensor, 
-                epoch=target_epoch,
-                save_doc=args.save_doc,
-                filename_prefix="External_Marmousi"
-            )
+        # --- 核心优化点：自适应遍历所有外部数据集 ---
+        if ext_val_sets:
+            for dataset_name, ext_data in ext_val_sets.items():
+                print(f"\n[*] ============================================")
+                print(f"[*] 正在处理外部数据集: {dataset_name}...")
+                
+                v_ext_test = ext_data["v_test"].to(device)   
+                u0_ext_test = ext_data["u0_test"].to(device) 
+                lab_ext_test = ext_data["lab_test"].to(device) 
+                
+                num_ext_sources = u0_ext_test.shape[0]
+                ext_vel_single = v_ext_test[0:1] 
+                ext_UU0_list = [u0_ext_test[i:i+1] for i in range(num_ext_sources)]
+                ext_labels_list = [lab_ext_test[i:i+1] for i in range(num_ext_sources)]
+                
+                # 1. 直接推理 (Direct Inference - No FineTuning)
+                plot_single_velocity_multi_sources(
+                    args, model, vel=ext_vel_single, UU0_list=ext_UU0_list, labels_list=ext_labels_list,
+                    epoch=target_epoch, save_doc=args.save_doc, filename_prefix=f"External_{dataset_name}",
+                    if_fine_tune=False, fno=None
+                )
+                
+                # 2. 域适应微调 (Fine-Tuning)
+                if args.if_finetune:
+                    plot_single_velocity_multi_sources(
+                        args, model, vel=ext_vel_single, UU0_list=ext_UU0_list, labels_list=ext_labels_list,
+                        epoch=target_epoch, save_doc=args.save_doc, filename_prefix=f"External_{dataset_name}",
+                        if_fine_tune=True, fno=fno 
+                    )
 
         print(f"\n========== 测试流程完毕！可视化结果已保存至: {args.save_doc} ==========")
 
@@ -419,7 +448,6 @@ def test(args, target_epoch, custom_weights_path=None):
     finally:
         torch.cuda.empty_cache()
         gc.collect()
-
 def main():
     args = Args_test()
     if torch.cuda.is_available():
@@ -431,7 +459,7 @@ def main():
     else:
         print("未找到可用GPU，将使用CPU训练")
     
-    test(args, 500) 
+    test(args, args.target_epoch) 
 
 if __name__ == "__main__":
     torch.cuda.empty_cache() 

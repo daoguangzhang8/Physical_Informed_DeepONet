@@ -200,15 +200,13 @@ def train(args):
 
                 plot_loss(i, args.save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss)
                 
-                # 新增：防止绘图函数内部构建冗余计算图导致 OOM
-                with torch.no_grad(): 
-                    if i % (args.save_fig_every * 20) == 0 and i > 0 and args.if_finetune:
-                        test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'FT_Marmousi', if_fine_tune=True)
+                if i % (args.save_fig_every * 20) == 0 and i > 0 and args.if_finetune:
+                    test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'FT_Marmousi', if_fine_tune=True)
                     
-                    test_plot(args, model, fno, i, dataloader["pred"], vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False)
-                    test_plot(args, model, fno, i, dataloader["test"], vel_test, UU0_test, labels_test, 'train', if_fine_tune=False)
-                    test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'Marmousi', if_fine_tune=False)
-                    plot_sinlge(model, args, 6, vel_test, UU0_test, labels_test)
+                test_plot(args, model, fno, i, dataloader["pred"], vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False)
+                test_plot(args, model, fno, i, dataloader["test"], vel_test, UU0_test, labels_test, 'train', if_fine_tune=False)
+                test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'Marmousi', if_fine_tune=False)
+                plot_sinlge(model, args, 6, vel_test, UU0_test, labels_test)
 
                 torch.cuda.empty_cache()
                 gc.collect()
@@ -216,7 +214,7 @@ def train(args):
             # ==========================================
             # 7. 模型保存
             # ==========================================
-            if i % args.save_model_every == 0 and i > 0:
+            if i % args.save_model_every == 0:
                 pbar.write(f'>>> Epoch {i} | 保存 Checkpoint: Total Loss {loss_log[-1]:.4e} | PDE Loss {loss_pde_log[-1]:.4e}')
                 
                 checkpoint = {
@@ -225,7 +223,7 @@ def train(args):
                     'scheduler_state_dict': scheduler.state_dict(),
                 }
                 
-                torch.save(checkpoint, os.path.join(args.save_doc, f'{args.filename}_PI_model_{i}epoch_weights.pth'))
+                torch.save(checkpoint, os.path.join(args.save_doc, f'{args.filename}_PI_model_{i}epoch_weights_{args.nz}.pth'))
                 np.save(os.path.join(args.save_doc, 'loss_log.npy'), loss_log)
                 np.save(os.path.join(args.save_doc, 'loss_data_log.npy'), loss_data_log)
                 np.save(os.path.join(args.save_doc, 'loss_pde_log.npy'), loss_pde_log)
@@ -234,6 +232,13 @@ def train(args):
         print(f"训练过程中断出错: {e}")
         raise
     finally:
+        checkpoint = {
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                }
+                
+        torch.save(checkpoint, os.path.join(args.save_doc, f'{args.filename}_PI_model_{i}epoch_weights_{args.nz}.pth'))
         # ==========================================
         # 8. 资源释放与清理
         # ==========================================

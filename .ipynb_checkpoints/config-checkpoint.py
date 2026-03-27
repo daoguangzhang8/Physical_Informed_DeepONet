@@ -4,7 +4,7 @@ class Args:
     # ==========================================
     load_path = '/home/sharedata/zdg'         # 数据集加载根目录
     weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
-    save_doc = 'output3'                       # 结果输出文件夹名称
+    save_doc = 'output2'                       # 结果输出文件夹名称
     filename = 'PI_DeepONet_pde'              # 保存的模型前缀名称
     
     # 外部泛化测试集配置 (支持动态扩展)
@@ -16,7 +16,7 @@ class Args:
     # ==========================================
     # 2. 硬件与设备配置 (Hardware & Device)
     # ==========================================
-    device = 2                                # 指定使用的 GPU 设备编号 (cuda:2)
+    device = 3                                # 指定使用的 GPU 设备编号 (cuda:2)
 
     # ==========================================
     # 3. 学习率调度器参数 (Learning Rate Scheduler)
@@ -39,10 +39,10 @@ class Args:
     # ==========================================
     # 5. 数据集与批处理配置 (Dataset & Dataloader)
     # ==========================================
-    nvel_train = 1                          # 训练所用的速度模型数量
+    nvel_train = 1500                          # 训练所用的速度模型数量
     ny_train = 4900                           # 训练集空间采样点总数
     batch_size = 700                          # Trunk Net 坐标采样批次大小 (num_sample)
-    batch_size_v = 1                          # Branch Net 速度场/背景场批次大小 (Batch_v)
+    batch_size_v = 35                          # Branch Net 速度场/背景场批次大小 (Batch_v)
     
     valid_rate = 0.1                          # 验证集划分比例
     validate_every = 100                      # 每隔多少个 epoch 执行一次模型验证
@@ -63,7 +63,7 @@ class Args:
     # ==========================================
     # 7. 微调与域适应配置 (Fine-Tuning for Out-of-Distribution)
     # ==========================================
-    if_finetune = True                        # 是否在外部复杂地层 (如 Marmousi) 上进行微调评估
+    if_finetune = False                       # 是否在外部复杂地层 (如 Marmousi) 上进行微调评估
     ft_NIter = 1000                             # 微调阶段的迭代步数
     ft_lr = 2e-5                              # 微调阶段的专属学习率
     ft_a = 0.2                                # 微调阶段的数据 Loss 权重
