@@ -26,9 +26,6 @@ class Pi_DeepONet(nn.Module):
         # --- 编码器与特征提取 ---
         self.pos_encoder = PositionalEncoding(embed_dim=4)
         self.fencoder = FourierFeatureEncoder(input_dim=2, mapping_size=self.feat_dim)
-        
-        self.pos_scale = nn.Parameter(torch.tensor(0.1))  # 位置编码缩放因子
-        self.pos_encoding = self._generate_global_pos_encoding()  # 全局位置编码
 
         # --- 网络分支 (Branch) ---
         self.branch1 = nn.Sequential(
@@ -84,20 +81,6 @@ class Pi_DeepONet(nn.Module):
                 if m.out_proj.bias is not None:
                     nn.init.zeros_(m.out_proj.bias)
 
-    def _generate_global_pos_encoding(self):
-        """生成全局位置编码，适配 (b1, b2, feat_dim) 维度"""
-        max_b2 = 6400
-        position = torch.arange(max_b2).unsqueeze(1)  # [max_b2, 1]
-        div_term = torch.exp(
-            torch.arange(0, self.feat_dim, 2, dtype=torch.float) 
-            * (-torch.log(torch.tensor(10000.0)) / self.feat_dim)
-        )
-        pe = torch.zeros(max_b2, self.feat_dim)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # [1, max_b2, feat_dim]
-        return nn.Parameter(pe, requires_grad=False)
-    
     def forward(self, vel, y, UU0):
         """
         前向传播
@@ -177,14 +160,14 @@ class Pi_DeepONet(nn.Module):
         grid = torch.stack([x_norm, z_norm], dim=-1).unsqueeze(1)  # [B_v, 1, B_pts, 2]
 
         # --- 2. 可微双线性插值采样 ---
-        # 采样速度场 c
+        # 采样速度场 c (detach: 速度场是输入数据，不需要梯度)
         c_sampled = F.grid_sample(vel[:, :1, :, :], grid, mode='bilinear', padding_mode='border', align_corners=True)
-        c = c_sampled.view(batch_size_v, batch_size_pts)
-        
-        # 采样背景场 U0
+        c = c_sampled.view(batch_size_v, batch_size_pts).detach()
+
+        # 采样背景场 U0 (detach: 背景场是输入数据，不需要梯度)
         U0_sampled = F.grid_sample(UU0, grid, mode='bilinear', padding_mode='border', align_corners=True).squeeze(2)
-        U0_real = U0_sampled[:, 0, :]
-        U0_imag = U0_sampled[:, 1, :]
+        U0_real = U0_sampled[:, 0, :].detach()
+        U0_imag = U0_sampled[:, 1, :].detach()
         
         # --- 3. 物理常数与衰减因子准备 ---
         c0 = torch.ones_like(c) * 1.5
@@ -206,18 +189,20 @@ class Pi_DeepONet(nn.Module):
         # --- 4. 一阶与二阶导数计算 (Autograd) ---
         Delta_U = self.forward(vel, y, UU0)
         Delta_U_real, Delta_U_imag = Delta_U[:, :, 0], Delta_U[:, :, 1]
-        
+
         zz, xx = y[:, :, 0], y[:, :, 1]
         ld = (Z_dim - 70) / 2
-        
-        lx = F.relu(((ld - 0.5) * 40 - xx) / ((ld - 0.5) * 40)) + F.relu((xx - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
-        lz = F.relu(((ld - 0.5) * 40 - zz) / ((ld - 0.5) * 40)) + F.relu((zz - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
-        
-        pml_tmp1 = C ** 2 * lx ** 2 * lz ** 2
-        pml_tmp2 = C ** 2 * lx ** 4
-        pml_tmp3 = C ** 2 * lz ** 4
-        pml_tmp4 = C * (lz ** 2 - lx ** 2)
-        pml_tmp5 = C * (lx ** 2 + lz ** 2)
+
+        # PML 边界系数 (detach: 只依赖坐标位置，不需要对网络参数求导)
+        with torch.no_grad():
+            lx = F.relu(((ld - 0.5) * 40 - xx) / ((ld - 0.5) * 40)) + F.relu((xx - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
+            lz = F.relu(((ld - 0.5) * 40 - zz) / ((ld - 0.5) * 40)) + F.relu((zz - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
+
+            pml_tmp1 = C ** 2 * lx ** 2 * lz ** 2
+            pml_tmp2 = C ** 2 * lx ** 4
+            pml_tmp3 = C ** 2 * lz ** 4
+            pml_tmp4 = C * (lz ** 2 - lx ** 2)
+            pml_tmp5 = C * (lx ** 2 + lz ** 2)
         
         # 计算一阶导数
         Delta_U_grad_real = torch.autograd.grad(Delta_U_real, y, grad_outputs=torch.ones_like(Delta_U_real), create_graph=True, retain_graph=True, only_inputs=True)[0]
@@ -373,17 +358,19 @@ class Pi_DeepONet(nn.Module):
         x_coord = (y[:, :, 1] / 40.0).long().clamp(0, nx - 1)
         labels = labels[batch_idx, :, z_coord, x_coord] 
         
-        # 2. 生成自适应物理采样点
+        # 2. 生成自适应物理采样点并与原始采样点合并 (减少一次 PDE 计算)
         y_ran = self.generate_structure_aware_y_ran(vel, num_pts=900, max_z=nz, max_x=nx)
-        
-        # 3. 计算各项基础损失
-        loss_u = self.loss_BC(vel, y, UU0, labels) / data_norm_coe
-        loss_f = self.loss_PDE_Scatter_pml(vel, y, UU0) / pde_norm_coe
-        loss_f_ran = self.loss_PDE_Scatter_pml(vel, y_ran, UU0) / pde_norm_coe
-        
-        loss_r = 0.0 # 占位
-        
-        # 4. 根据权重加权求和
-        loss_val = (a * loss_u) + b * (loss_f + loss_f_ran)
 
-        return loss_val, loss_f + loss_f_ran, loss_u, loss_r
+        # 合并 y 和 y_ran， batch_size_v = y.shape[0]
+        y_combined = torch.cat([y, y_ran], dim=1)  # [B_v, B_pts + B_ran_pts, 2]
+
+        # 3. 计算各项基础损失 (PDE 只需计算一次)
+        loss_u = self.loss_BC(vel, y, UU0, labels) / data_norm_coe
+        loss_f_combined = self.loss_PDE_Scatter_pml(vel, y_combined, UU0) / pde_norm_coe
+
+        loss_r = 0.0  # 占位
+
+        # 4. 根据权重加权求和
+        loss_val = (a * loss_u) + b * loss_f_combined
+
+        return loss_val, loss_f_combined, loss_u, loss_r

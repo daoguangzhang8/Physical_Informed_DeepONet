@@ -4,7 +4,7 @@ class Args:
     # ==========================================
     load_path = '/home/sharedata/zdg'         # 数据集加载根目录
     weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
-    save_doc = 'output2'                       # 结果输出文件夹名称
+    save_doc = 'output1'                       # 结果输出文件夹名称
     filename = 'PI_DeepONet_pde'              # 保存的模型前缀名称
     
     # 外部泛化测试集配置 (支持动态扩展)
@@ -16,7 +16,7 @@ class Args:
     # ==========================================
     # 2. 硬件与设备配置 (Hardware & Device)
     # ==========================================
-    device = 3                                # 指定使用的 GPU 设备编号 (cuda:2)
+    device = 2                                # 指定使用的 GPU 设备编号 (cuda:2)
 
     # ==========================================
     # 3. 学习率调度器参数 (Learning Rate Scheduler)
@@ -39,18 +39,18 @@ class Args:
     # ==========================================
     # 5. 数据集与批处理配置 (Dataset & Dataloader)
     # ==========================================
-    nvel_train = 1500                          # 训练所用的速度模型数量
+    nvel_train = 1                          # 训练所用的速度模型数量
     ny_train = 4900                           # 训练集空间采样点总数
     batch_size = 700                          # Trunk Net 坐标采样批次大小 (num_sample)
-    batch_size_v = 35                          # Branch Net 速度场/背景场批次大小 (Batch_v)
+    batch_size_v = 1                          # Branch Net 速度场/背景场批次大小 (Batch_v)
     
     valid_rate = 0.1                          # 验证集划分比例
     validate_every = 100                      # 每隔多少个 epoch 执行一次模型验证
     valid_batch_size = 350                    # 验证集坐标采样批次大小
     valid_batch_size_v = 6                    # 验证集速度场批次大小
-    accumulation_steps = 2                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
+    accumulation_steps = 4                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
 
-    source_list = [2]
+    source_list = [0,1,2,3,4]
     # ==========================================
     # 6. 物理网格与边界条件 (Physical Grid & PML Boundaries)
     # ==========================================
@@ -73,7 +73,7 @@ class Args:
     # ==========================================
     # 8. 主训练循环超参数 (Main Training Hyperparameters)
     # ==========================================
-    NIter = 10000 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
+    NIter = 100 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
     warmup_epochs = 100                       # 学习率热身 (Warmup) 的 epoch 数
     lr = 1 * 1e-4                             # 初始基础学习率
     weight_decay = 1e-4                       # 优化器权重衰减 (L2 正则化)系数

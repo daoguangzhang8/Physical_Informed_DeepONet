@@ -18,3 +18,5 @@ __pycache__/
 runs/
 logs/
 .ipynb_checkpoints/
+nohup.out
+*.pyc

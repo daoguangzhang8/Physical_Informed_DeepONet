@@ -183,18 +183,24 @@ def prepare_training_dataloaders(args, device):
     y_pred = points.float() * 40
     y_test = y_pred
 
-    # 6. 构建 DataLoader
+    # 6. 构建 DataLoader (添加 num_workers 加速数据加载)
     pin_mem = device.type == 'cuda'
-    
+    num_workers = 4
+    prefetch_factor = 2
+
     train_loaders = {
-        "train": DataLoader(TensorDataset(vel_train, UU0_train, labels_train), 
-                            batch_size=args.batch_size_v, shuffle=True, drop_last=True, pin_memory=pin_mem),
-        "train_y": DataLoader(TensorDataset(y_train), 
-                              batch_size=args.batch_size, shuffle=True, pin_memory=pin_mem),
-        "valid": DataLoader(TensorDataset(vel_valid, UU0_valid, labels_valid), 
-                            batch_size=args.valid_batch_size_v, shuffle=True, drop_last=True, pin_memory=pin_mem),
-        "valid_y": DataLoader(TensorDataset(y_valid), 
-                              batch_size=args.valid_batch_size, shuffle=True, pin_memory=pin_mem),
+        "train": DataLoader(TensorDataset(vel_train, UU0_train, labels_train),
+                            batch_size=args.batch_size_v, shuffle=True, drop_last=True,
+                            pin_memory=pin_mem, num_workers=num_workers, prefetch_factor=prefetch_factor),
+        "train_y": DataLoader(TensorDataset(y_train),
+                              batch_size=args.batch_size, shuffle=True, pin_memory=pin_mem,
+                              num_workers=num_workers, prefetch_factor=prefetch_factor),
+        "valid": DataLoader(TensorDataset(vel_valid, UU0_valid, labels_valid),
+                            batch_size=args.valid_batch_size_v, shuffle=True, drop_last=True,
+                            pin_memory=pin_mem, num_workers=num_workers, prefetch_factor=prefetch_factor),
+        "valid_y": DataLoader(TensorDataset(y_valid),
+                              batch_size=args.valid_batch_size, shuffle=True, pin_memory=pin_mem,
+                              num_workers=num_workers, prefetch_factor=prefetch_factor),
         "pred": DataLoader(TensorDataset(y_pred), batch_size=args.batch_size, shuffle=False),
         "test": DataLoader(TensorDataset(y_test), batch_size=args.batch_size, shuffle=False)
     }

@@ -12,7 +12,7 @@ from model.utils import *
 from model.dataloader import *
 from model.PI_DeepOnet import Pi_DeepONet
 from model.FNO import FNO
-from model.ploting import *
+from model.plotting import *
 
 class Args_test:
     # ==========================================
@@ -25,11 +25,11 @@ class Args_test:
 
     source_list = [0, 1, 2, 3, 4]
     ext_val_datasets = {
-        'Marmousi': {'prefix': 'marmousi_', 'loc_target': source_list}, 
+        # 'Marmousi': {'prefix': 'marmousi_', 'loc_target': source_list}, 
         '1994BP': {'prefix': '1994BP_', 'loc_target': source_list},
-        'SEAM': {'prefix': 'SEAM_', 'loc_target': source_list},
+        # 'SEAM': {'prefix': 'SEAM_', 'loc_target': source_list},
     }
-    target_epoch = 1000
+    target_epoch = 500
     # ==========================================
     # 2. 硬件与设备配置
     # ==========================================
@@ -81,11 +81,11 @@ class Args_test:
     # 7. 微调与域适应配置
     # ==========================================
     if_finetune = True                        
-    ft_NIter = 10                             
+    ft_NIter = 1000                             
     ft_lr = 2e-5                              
     ft_a = 0.2                                
     ft_b = 1                                  
-    ft_c = 1                                  
+    ft_c = 0.1                                  
     
     # ==========================================
     # 8. 主训练循环超参数
@@ -363,13 +363,13 @@ def test(args, target_epoch, custom_weights_path=None):
         model = Pi_DeepONet(args).to(device)
         
         fno = FNO(args).to(device)
-        fno.load_state_dict(torch.load('FNO_PI_model_8000epoch_weights.pth', map_location=device)['model_state_dict'])
+        # fno.load_state_dict(torch.load('FNO_bad_PI_model_100epoch_weights.pth', map_location=device)['model_state_dict'])
         fno.eval() # FNO 仅作推断生成 labels，设为评估模式
         
         if custom_weights_path:
             model_path = custom_weights_path
         else:
-            model_path = os.path.join(args.save_doc, f'{args.filename}_PI_model_{target_epoch}epoch_weights.pth')
+            model_path = os.path.join(args.save_doc, f'{args.filename}_PI_model_{target_epoch}epoch_weights_72.pth')
             
         print(f"[*] 正在加载 PI_DeepONet 权重: {model_path}")
         if not os.path.exists(model_path):

@@ -19,7 +19,7 @@ def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
     z_coords = torch.arange(0, nz * times)
     NN = x_coords.shape[0] * z_coords.shape[0]
 
-    grid_z, grid_x = torch.meshgrid(z_coords, x_coords)
+    grid_z, grid_x = torch.meshgrid(z_coords, x_coords, indexing='ij')
     points = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1)
     y_pred = points.float() * spatial_step / times
     
@@ -243,7 +243,9 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
     data_norm_coe = 1.
     
     optimizer = optim.Adam(model_ft.parameters(), lr=lr, weight_decay=args.weight_decay)
-    
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=args.factor, patience=50, min_lr=1e-6
+        )
     loss_f_log = []
     loss_u_log = []
     loss_r_log = []
@@ -262,7 +264,7 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
     model_ft.train()
     with torch.no_grad():
         labels_fno = fno(vel.to(device), UU0.to(device)).to(device)
-        
+    optimizer.zero_grad()
     for i in range(NIter):
         batch_loss = []
         for batch in dataloader_y:
@@ -271,21 +273,21 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
             
             # 计算损失
             loss, loss_f, loss_u, loss_r = model_ft.loss(
-                vel.to(device), y_batch, UU0.to(device), labels_fno.to(device), 
+                vel.to(device), y_batch, UU0.to(device), labels.to(device), 
                 a, b, c, data_norm_coe, pde_norm_coe
             )
             loss_op = c * model_ft.loss_op(model0, vel.to(device), y_batch, UU0.to(device))
             loss = loss + loss_op
             
             # 修复：将除以累加步数后的结果重新赋值给 loss，否则梯度会按原比例回传
-            loss = loss / args.accumulation_steps 
+            loss = loss 
             
             # 反向传播
             loss.backward()
             
-            if (i + 1) % args.accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad() # 更新完后清空梯度
+            # if (i + 1) % args.accumulation_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad() # 更新完后清空梯度
                 
             batch_loss.append(loss.item())
             loss_u_log.append(loss_u.item())
@@ -294,8 +296,8 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
             
         # 动态权重更新
         if first_flag:
-            data_norm_coe = np.mean(loss_u_log)/(args.batch_size * args.batch_size_v * 2)
-            pde_norm_coe = np.mean(loss_f_log)/(args.batch_size * args.batch_size_v * 2)
+            data_norm_coe = np.mean(loss_u_log)
+            pde_norm_coe = np.mean(loss_f_log)
             first_flag = False
             
         # 计算当前 Epoch 的平均总损失

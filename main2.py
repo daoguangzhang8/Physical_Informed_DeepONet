@@ -2,7 +2,7 @@ from Labconfig import *
 from config import *
 from model.PI_DeepOnet import *
 from model.train import train
-from model.ploting import *
+from model.plotting import *
 
 
 

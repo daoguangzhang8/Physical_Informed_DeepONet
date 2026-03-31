@@ -9,7 +9,7 @@ from model.utils import *
 from model.dataloader import *
 from model.PI_DeepOnet import Pi_DeepONet
 from model.FNO import FNO
-from model.ploting import *
+from model.plotting import *
 
 def train(args):
     try:
@@ -35,12 +35,12 @@ def train(args):
         # 2. 模型与优化器初始化
         # ==========================================
         model = Pi_DeepONet(args).to(device)
-        model._init_weights()  
+        model._init_weights()
         print(f"PI_DeepONet 模型总参数数量：{count_parameters(model)}")
-        
+
         # 加载预训练的 FNO 模型用于生成 labels
         fno = FNO(args).to(device)
-        fno.load_state_dict(torch.load('FNO_PI_model_8000epoch_weights.pth', map_location=device)['model_state_dict'])
+        # fno.load_state_dict(torch.load('FNO_bad_PI_model_100epoch_weights.pth', map_location=device)['model_state_dict'])
         fno.eval() # FNO 仅作推断生成 labels，设为评估模式
         
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -87,13 +87,13 @@ def train(args):
             batch_loss, batch_u_loss, batch_f_loss, batch_r_loss = [], [], [], []
             
             # 遍历训练数据
-            for vel_batch, UU0_batch, _ in dataloader['train']:
+            for vel_batch, UU0_batch, labels_batch in dataloader['train']:
                 vel_batch, UU0_batch = vel_batch.to(device), UU0_batch.to(device)
                 
                 # 使用 FNO 动态生成 labels
-                # labels_batch = labels.to(device)
-                with torch.no_grad():
-                    labels_batch = fno(vel_batch, UU0_batch).to(device)
+                labels_batch = labels_batch.to(device)
+                # with torch.no_grad():
+                #     labels_batch = fno(vel_batch, UU0_batch).to(device)
                 
                 # 针对每个空间坐标点集计算损失
                 for batch in dataloader['train_y']:
@@ -129,20 +129,20 @@ def train(args):
             # 记录当前 Epoch 损失并更新进度条显示
             # ------------------------------------------
             avg_loss = np.mean(batch_loss) if batch_loss else 0
-            
+
             if first_flag:
-                data_norm_coe = np.mean(batch_u_loss)
-                pde_norm_coe = np.mean(batch_f_loss)
+                data_norm_coe = np.mean(batch_u_loss) if batch_u_loss else 1.0
+                pde_norm_coe = np.mean(batch_f_loss) if batch_f_loss else 1.0
                 loss_log.append(a + b)
                 loss_data_log.append(1.)
                 loss_pde_log.append(1.)
-                loss_reg_log.append(np.mean(batch_r_loss) / (args.batch_size * args.batch_size_v))
+                loss_reg_log.append(np.mean(batch_r_loss) / (args.batch_size * args.batch_size_v) if batch_r_loss else 0)
                 first_flag = False
             else:
                 loss_log.append(avg_loss)
-                loss_data_log.append(np.mean(batch_u_loss))
-                loss_pde_log.append(np.mean(batch_f_loss))
-                loss_reg_log.append(np.mean(batch_r_loss))
+                loss_data_log.append(np.mean(batch_u_loss) if batch_u_loss else 0)
+                loss_pde_log.append(np.mean(batch_f_loss) if batch_f_loss else 0)
+                loss_reg_log.append(np.mean(batch_r_loss) if batch_r_loss else 0)
                 
             current_lr = optimizer.param_groups[0]['lr']
             
@@ -184,8 +184,8 @@ def train(args):
                         batch_u_loss.append(loss_u_valid.item())
                         batch_f_loss.append(loss_f_valid.item())
                             
-                valid_u_loss.append(np.mean(batch_u_loss))
-                valid_f_loss.append(np.mean(batch_f_loss)) 
+                valid_u_loss.append(np.mean(batch_u_loss) if batch_u_loss else 0.0)
+                valid_f_loss.append(np.mean(batch_f_loss) if batch_f_loss else 1.0) 
 
             # ==========================================
             # 6. 可视化与绘图
