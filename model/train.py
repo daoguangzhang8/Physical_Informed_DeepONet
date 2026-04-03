@@ -40,7 +40,9 @@ def train(args):
 
         # 加载预训练的 FNO 模型用于生成 labels
         fno = FNO(args).to(device)
-        # fno.load_state_dict(torch.load('FNO_bad_PI_model_100epoch_weights.pth', map_location=device)['model_state_dict'])
+        if args.use_fno_as_label and args.fno_weights_path:
+            fno.load_state_dict(torch.load(args.fno_weights_path, map_location=device)['model_state_dict'])
+            print(f"已加载 FNO 权重: {args.fno_weights_path}")
         fno.eval() # FNO 仅作推断生成 labels，设为评估模式
         
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -89,11 +91,13 @@ def train(args):
             # 遍历训练数据
             for vel_batch, UU0_batch, labels_batch in dataloader['train']:
                 vel_batch, UU0_batch = vel_batch.to(device), UU0_batch.to(device)
-                
-                # 使用 FNO 动态生成 labels
-                labels_batch = labels_batch.to(device)
-                # with torch.no_grad():
-                #     labels_batch = fno(vel_batch, UU0_batch).to(device)
+
+                # 根据配置选择标签来源
+                if args.use_fno_as_label:
+                    with torch.no_grad():
+                        labels_batch = fno(vel_batch, UU0_batch).to(device)
+                else:
+                    labels_batch = labels_batch.to(device)
                 
                 # 针对每个空间坐标点集计算损失
                 for batch in dataloader['train_y']:
@@ -194,9 +198,9 @@ def train(args):
                 vel_pred, UU0_pred, labels_pred = plot_data["vel_pred"], plot_data["UU0_pred"], plot_data["labels_pred"]
                 vel_test, UU0_test, labels_test = plot_data["vel_test"], plot_data["UU0_test"], plot_data["labels_test"]
 
-                marmousi_data = ext_val_sets['Marmousi']
-                v_m_test, u0_m_test, lab_m_test = marmousi_data["plot_data"]["v_test"], marmousi_data["plot_data"]["u0_test"], marmousi_data["plot_data"]["lab_test"]
-                dataloader_m_y_full = marmousi_data["loader"]
+                # marmousi_data = ext_val_sets['Marmousi']
+                # v_m_test, u0_m_test, lab_m_test = marmousi_data["plot_data"]["v_test"], marmousi_data["plot_data"]["u0_test"], marmousi_data["plot_data"]["lab_test"]
+                # dataloader_m_y_full = marmousi_data["loader"]
 
                 plot_loss(i, args.save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss)
                 
@@ -205,7 +209,7 @@ def train(args):
                     
                 test_plot(args, model, fno, i, dataloader["pred"], vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False)
                 test_plot(args, model, fno, i, dataloader["test"], vel_test, UU0_test, labels_test, 'train', if_fine_tune=False)
-                test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'Marmousi', if_fine_tune=False)
+                # test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'Marmousi', if_fine_tune=False)
                 plot_sinlge(model, args, 6, vel_test, UU0_test, labels_test)
 
                 torch.cuda.empty_cache()

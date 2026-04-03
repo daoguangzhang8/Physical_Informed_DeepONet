@@ -73,9 +73,10 @@ class Args_test:
     # ==========================================
     nx = 70                                   
     nz = 70                                   
-    pml = True                                
-    Lpml = 9                                  
-    LD = 10 - Lpml                            
+    pml = True
+    pml_total = 10
+    pml_crop = 9
+    pml_active = pml_total - pml_crop                            
     
     # ==========================================
     # 7. 微调与域适应配置
@@ -183,7 +184,7 @@ def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, 
         
     eval_model.eval()
     
-    L = args.LD
+    L = args.pml_active
     slc = slice(L, -L) if L > 0 else slice(None)
     
     fig_real, axes_real = plt.subplots(3, num_sources, figsize=(3.5 * num_sources, 10))
@@ -314,14 +315,14 @@ def test(args, target_epoch, custom_weights_path=None):
         UU0_original = load_tensor_from_npy(args.load_path, 'backgroundfield_data_freq5_1source_70_70_n1.npy')
         UU_original = load_tensor_from_npy(args.load_path, 'wavefield_data_freq5_5sources_70_70_n1.npy')
         
-        args.nx = args.nx + args.LD * 2
-        args.nz = args.nz + args.LD * 2
-        
+        args.nx = args.nx + args.pml_active * 2
+        args.nz = args.nz + args.pml_active * 2
+
         if args.pml:
-            Lpml = args.Lpml
-            vel = vel_original[:, Lpml:-Lpml, Lpml:-Lpml]
-            UU0 = UU0_original[:, :, Lpml:-Lpml, Lpml:-Lpml]
-            UU = UU_original[:, :, Lpml:-Lpml, Lpml:-Lpml]
+            pml_crop = args.pml_crop
+            vel = vel_original[:, pml_crop:-pml_crop, pml_crop:-pml_crop]
+            UU0 = UU0_original[:, :, pml_crop:-pml_crop, pml_crop:-pml_crop]
+            UU = UU_original[:, :, pml_crop:-pml_crop, pml_crop:-pml_crop]
         else:
             vel, UU0, UU = vel_original, UU0_original, UU_original
     

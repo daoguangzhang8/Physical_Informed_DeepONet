@@ -120,6 +120,13 @@ python test.py
 | `save_model_every` | 500 | 模型保存间隔 |
 | `save_fig_every` | 50 | 可视化保存间隔 |
 
+### 标签来源配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `use_fno_as_label` | False | True: 使用 FNO 预测作为软标签 / False: 使用真实标签 |
+| `fno_weights_path` | '' | FNO 预训练权重路径 (当 `use_fno_as_label=True` 时需要指定) |
+
 ### 物理约束配置
 
 | 参数 | 默认值 | 说明 |
@@ -127,7 +134,25 @@ python test.py
 | `a` | 1 | 数据损失权重 |
 | `b` | 1 | PDE 损失权重 |
 | `c` | 0 | 正则化损失权重 |
-| `if_adjust` | True | 是否动态调整损失权重 |
+
+### Loss 构成说明
+
+总损失函数：
+
+$$L_{total} = a \cdot L_{data} + b \cdot L_{pde}$$
+
+**Data Loss** (仅在标签点上计算):
+$$L_{data} = MSE(u_{pred}[y], u_{label}[y])$$
+
+- `use_fno_as_label=False`: $u_{label}$ 为真实波场标签
+- `use_fno_as_label=True`: $u_{label}$ 为 FNO 预测值 (软标签)
+
+**PDE Loss** (在所有采样点上计算):
+$$L_{pde} = \|\nabla^2 u_{pred} + \omega^2 k^2 u_{pred}\|^2$$
+
+采样点包括:
+- 标签点 $y$: 有监督数据的位置
+- 自由配点 $y_{ran}$: 结构感知自适应采样生成的物理约束点
 
 ### 网络架构配置
 

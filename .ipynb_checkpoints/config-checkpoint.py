@@ -50,7 +50,7 @@ class Args:
     valid_batch_size_v = 6                    # 验证集速度场批次大小
     accumulation_steps = 2                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
 
-    source_list = [2]
+    source_list = [0,1,2,3,4]
     # ==========================================
     # 6. 物理网格与边界条件 (Physical Grid & PML Boundaries)
     # ==========================================

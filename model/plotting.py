@@ -3,16 +3,29 @@ from Labconfig import *
 from model.utils import *
 
 def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
-    L = args.LD
-    L1 = args.LD * times
-    Nz = args.nz * times
-    Nx = args.nx * times
-    
-    nx = args.nx
-    nz = args.nz
+    # 使用 pml_active 作为画图时的裁切力度（训练数据保留了 pml_active 个 PML 网格）
+    L = args.pml_active
+    L1 = args.pml_active * times
+    # 使用标签的实际尺寸来确定网格大小
+    actual_nz = labels_pred.shape[2]  # 实际的 z 维度
+    actual_nx = labels_pred.shape[3]  # 实际的 x 维度
+    Nz = actual_nz * times
+    Nx = actual_nx * times
+
+    nx = actual_nx
+    nz = actual_nz
     spatial_step = 40.
     device = args.device
-    tag_num = args.nz * times - L1 * 2
+
+    # 根据边界类型计算裁切后的有效网格数（物理区域）
+    if args.boundary_type == 'free_surface':
+        # free_surface: 顶部不裁切，底部裁 L1，左右各裁 L1
+        tag_nz = actual_nz * times - L1      # z 方向：只裁底部
+        tag_nx = actual_nx * times - 2 * L1  # x 方向：左右都裁
+    else:  # 'full_pml'
+        # full_pml: 四边都裁切
+        tag_nz = actual_nz * times - 2 * L1  # z 方向：上下都裁
+        tag_nx = actual_nx * times - 2 * L1  # x 方向：左右都裁
 
 
     x_coords = torch.arange(0, nx * times)
@@ -22,10 +35,10 @@ def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
     grid_z, grid_x = torch.meshgrid(z_coords, x_coords, indexing='ij')
     points = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1)
     y_pred = points.float() * spatial_step / times
-    
+
     dataset_test = TensorDataset(y_pred)
     dataloader_test = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=False)
-    
+
     model.eval()
     u_test = []
     with torch.no_grad():
@@ -36,41 +49,65 @@ def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
             u_pred_batch = model(vel_pred.to(device), y_batch, UU0_pred.to(device)).squeeze(0)
             u_test.append(u_pred_batch.detach().cpu().numpy())
 
-    # 保存测试结果（与原逻辑一致）
+    # 保存测试结果（修复：使用实际计算出的 Nz, Nx）
     U_pred_test = np.vstack(u_test)
     U_pred_test = U_pred_test.reshape(Nz, Nx, 2)
-    U_pred_real_test = U_pred_test[L1:-L1, L1:-L1, 0]
-    U_pred_imag_test = U_pred_test[L1:-L1, L1:-L1, 1]
-    
+
+    # 根据边界类型确定切片范围
+    if args.boundary_type == 'free_surface':
+        z_slice_pred = slice(0, -L1)    # 顶部不切
+    else:
+        z_slice_pred = slice(L1, -L1)   # 上下都切
+    x_slice_pred = slice(L1, -L1)       # 左右都切
+
+    U_pred_real_test = U_pred_test[z_slice_pred, x_slice_pred, 0]
+    U_pred_imag_test = U_pred_test[z_slice_pred, x_slice_pred, 1]
+
     y_pred_np = y_pred.detach().cpu().numpy()
     labels_pred_np = labels_pred.detach().cpu().numpy()
     U_test = labels_pred_np[0,:,:,:]
-    U_test_real = U_test[0, L:-L, L:-L][:, :]
-    U_test_imag = U_test[1, L:-L, L:-L][:, :]
-    
-    x_test = np.linspace(0, 2800, num=70, endpoint=True)  # 70个点，对应实际距离0-2800
-    # 2. 为280长度的数据（U_pred_real_test）生成横坐标：0-2800，间隔10
-    x_pred = np.linspace(0, 2800, num=tag_num, endpoint=True)  # 280个点，对应实际距离0-2800
-    
+
+    # 标签数据使用原始网格的裁切（不乘 times）
+    if args.boundary_type == 'free_surface':
+        z_slice_label = slice(0, -L)    # 顶部不切
+    else:
+        z_slice_label = slice(L, -L)    # 上下都切
+    x_slice_label = slice(L, -L)        # 左右都切
+
+    U_test_real = U_test[0, z_slice_label, x_slice_label]
+    U_test_imag = U_test[1, z_slice_label, x_slice_label]
+
+    # 计算物理区域的实际距离范围（基于原始物理区域 70×70，空间步长 40m）
+    physical_size_z = 70 * 40  # 2800m
+    physical_size_x = 70 * 40  # 2800m
+
+    # 为参考数据（裁切后的标签）生成横坐标
+    x_test = np.linspace(0, physical_size_x, num=U_test_real.shape[1], endpoint=True)
+
+    # 为预测数据生成横坐标
+    x_pred = np.linspace(0, physical_size_x, num=U_pred_real_test.shape[1], endpoint=True)
+
     # ===================== 绘图逻辑修改 =====================
-    figure1, ax1 = plt.subplots(figsize=(10, 6))  # 注意：plt.figure() 返回单个对象，plt.subplots() 返回 (fig, ax)
-    # 绘制70点的参考数据（U_test_real）
-    ax1.plot(x_test, U_test_real[:, 70//2], label='Reference Real (70 points)', linewidth=2, color='#ff7f0e')
-    # 绘制280点的预测数据（U_pred_real_test）
-    ax1.plot(x_pred, U_pred_real_test[:, tag_num//2], label=f'Predicted Real ({tag_num} points)', linewidth=1.5, color='#1f77b4')
+    figure1, ax1 = plt.subplots(figsize=(10, 6))
+    # 绘制参考数据
+    mid_x_idx = U_test_real.shape[1] // 2  # 取中间位置
+    ax1.plot(x_test, U_test_real[:, mid_x_idx], label='Reference Real', linewidth=2, color='#ff7f0e')
+    # 绘制预测数据
+    mid_x_idx_pred = U_pred_real_test.shape[1] // 2
+    ax1.plot(x_pred, U_pred_real_test[:, mid_x_idx_pred], label='Predicted Real', linewidth=1.5, color='#1f77b4')
     
-    # 图表美化（强制统一x轴尺度为0-2800）
-    ax1.set_title('Real Part Comparison at Mid X-Line (0-2800 Distance)', fontsize=12)
-    ax1.set_xlabel('Distance (m)', fontsize=10)  # x轴改为实际距离（米）
+    # 图表美化
+    ax1.set_title(f'Real Part Comparison at Mid X-Line ({args.boundary_type})', fontsize=12)
+    ax1.set_xlabel('Distance (m)', fontsize=10)
     ax1.set_ylabel('Amplitude', fontsize=10)
-    ax1.set_xlim(0, 2800)  # 强制x轴范围为0-2800，保证尺度统一
+    ax1.set_xlim(0, physical_size_x)
     ax1.grid(True, alpha=0.3)
     ax1.legend(fontsize=9)
-    
+
     # 保存图片
-    plt.tight_layout()  # 防止标签被截断
+    plt.tight_layout()
     plt.savefig(args.save_doc + '/singleline.png', bbox_inches='tight')
-    plt.close(figure1)  # 关闭画布，释放内存
+    plt.close(figure1)
 
 
 
@@ -124,10 +161,11 @@ def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_
         model = fine_tuning(args, model, fno, dataloader_y, vel, UU0, labels)
     model.eval()
     device = args.device
-    L = args.LD
+    # 使用 pml_active 作为画图时的裁切力度（训练数据保留了 pml_active 个 PML 网格）
+    L = args.pml_active
     # filename = args.filename
     u_pred = []
-    
+
     with torch.no_grad():
         for batch in dataloader_y:
             y_batch = batch[0].to(device)
@@ -136,17 +174,28 @@ def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_
             u_batch = model(vel.to(device), y_batch, UU0.to(device)).squeeze(0)
             u_pred.append(u_batch.detach().cpu().numpy())
 
-    # 处理预测结果（与原逻辑一致）
+    # 处理预测结果（修复：使用实际数据尺寸而非配置参数）
     U_pred = np.vstack(u_pred)
-    U_pred = U_pred.reshape(args.nz, args.nx, 2)
-    U_pred_real = U_pred[L:-L, L:-L, 0]
-    U_pred_imag = U_pred[L:-L, L:-L, 1]
-    
+    # 使用标签的实际尺寸来确定 reshape 参数
+    actual_nz = labels.shape[2]  # 实际的 z 维度
+    actual_nx = labels.shape[3]  # 实际的 x 维度
+    U_pred = U_pred.reshape(actual_nz, actual_nx, 2)
+
+    # 根据边界类型确定切片范围
+    if args.boundary_type == 'free_surface':
+        z_slice = slice(0, -L)    # 顶部不切
+    else:
+        z_slice = slice(L, -L)    # 上下都切
+    x_slice = slice(L, -L)        # 左右都切
+
+    U_pred_real = U_pred[z_slice, x_slice, 0]
+    U_pred_imag = U_pred[z_slice, x_slice, 1]
+
     # 处理标签数据（与原逻辑一致）
     labels_np = labels.detach().cpu().numpy()
     U_ref = labels_np[0,:,:,:]
-    U_ref_real = U_ref[0, L:-L, L:-L][:, :]
-    U_ref_imag = U_ref[1, L:-L, L:-L][:, :]
+    U_ref_real = U_ref[0, z_slice, x_slice]
+    U_ref_imag = U_ref[1, z_slice, x_slice]
 
     # 计算误差（与原逻辑一致）
     Umaxr, Uminr = np.max(U_ref_real), np.min(U_ref_real)
@@ -236,7 +285,7 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
     c = args.ft_c
     nz = args.nz
     nx = args.nx
-    Lpml = args.Lpml
+    pml_crop = args.pml_crop
     
     first_flag = True
     pde_norm_coe = 1.

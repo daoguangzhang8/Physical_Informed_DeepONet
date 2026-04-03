@@ -40,7 +40,7 @@ def train(args):
         
         # 加载预训练的 FNO 模型用于生成 labels
         fno = FNO(args).to(device)
-        fno.load_state_dict(torch.load('FNO_PI_model_8000epoch_weights.pth', map_location=device)['model_state_dict'])
+        # fno.load_state_dict(torch.load('FNO_bad_PI_model_100epoch_weights.pth', map_location=device)['model_state_dict'])
         fno.eval() # FNO 仅作推断生成 labels，设为评估模式
         
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -87,13 +87,13 @@ def train(args):
             batch_loss, batch_u_loss, batch_f_loss, batch_r_loss = [], [], [], []
             
             # 遍历训练数据
-            for vel_batch, UU0_batch, _ in dataloader['train']:
+            for vel_batch, UU0_batch, labels_batch in dataloader['train']:
                 vel_batch, UU0_batch = vel_batch.to(device), UU0_batch.to(device)
                 
                 # 使用 FNO 动态生成 labels
-                # labels_batch = labels.to(device)
-                with torch.no_grad():
-                    labels_batch = fno(vel_batch, UU0_batch).to(device)
+                labels_batch = labels_batch.to(device)
+                # with torch.no_grad():
+                #     labels_batch = fno(vel_batch, UU0_batch).to(device)
                 
                 # 针对每个空间坐标点集计算损失
                 for batch in dataloader['train_y']:

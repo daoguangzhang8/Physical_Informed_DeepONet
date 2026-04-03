@@ -8,7 +8,7 @@ def Training_data(args, vel, UU_loc, UU0_loc):
     生成训练数据和验证数据（支持多震源并发训练）
     """
     # 1. 基本参数准备
-    nvel, ny, Lpml = args.nvel_train, args.ny_train, args.Lpml
+    nvel, ny, pml_crop = args.nvel_train, args.ny_train, args.pml_crop
     spatial_step = 40
     nz, nx = vel.shape[1], vel.shape[2]
     valid_num = int(args.valid_rate * nvel) + 1
@@ -20,8 +20,8 @@ def Training_data(args, vel, UU_loc, UU0_loc):
     
     # 定义波源坐标候选列表
     source_coords = [
-        [Lpml//2 + 1, Lpml//2 + 5], [Lpml//2 + 1, Lpml//2 + 20], [Lpml//2 + 1, Lpml//2 + 35], 
-        [Lpml//2 + 1, Lpml//2 + 50], [Lpml//2 + 1, Lpml//2 + 65]
+        [pml_crop//2 + 1, pml_crop//2 + 5], [pml_crop//2 + 1, pml_crop//2 + 20], [pml_crop//2 + 1, pml_crop//2 + 35],
+        [pml_crop//2 + 1, pml_crop//2 + 50], [pml_crop//2 + 1, pml_crop//2 + 65]
     ]
     loc_list = args.source_list  # 现在可以包含多个震源，例如 [1, 2, 3]
     
@@ -145,21 +145,33 @@ def prepare_training_dataloaders(args, device):
     仅处理用于模型训练和内部验证的数据流
     """
     # 1. 基础训练数据读取
-    vel_original = load_tensor_from_npy(args.load_path, 'velocity_data_70_70_n1.npy')
-    UU0_original = load_tensor_from_npy(args.load_path, 'backgroundfield_data_freq5_1source_70_70_n1.npy')
-    UU_original = load_tensor_from_npy(args.load_path, 'wavefield_data_freq5_5sources_70_70_n1.npy')
-    
+    vel_original = load_tensor_from_npy(args.load_path, args.vel_filename)
+    UU0_original = load_tensor_from_npy(args.load_path, args.backgroundfield_filename)
+    UU_original = load_tensor_from_npy(args.load_path, args.wavefield_filename)
+
     # 2. PML 边界处理
-    args.nx = args.nx + args.LD * 2
-    args.nz = args.nz + args.LD * 2
-    
     if args.pml:
-        Lpml = args.Lpml
-        vel = vel_original[:, Lpml:-Lpml, Lpml:-Lpml]
-        UU0 = UU0_original[:, :, Lpml:-Lpml, Lpml:-Lpml]
-        UU = UU_original[:, :, Lpml:-Lpml, Lpml:-Lpml]
+        pml_crop = args.pml_crop
+        # 根据边界类型确定切片范围
+        if args.boundary_type == 'free_surface':
+            z_slice = slice(0, -pml_crop)          # 顶部不切，底部切 pml_crop
+        else:  # 'full_pml'
+            z_slice = slice(pml_crop, -pml_crop)   # 上下都切 pml_crop
+
+        x_slice = slice(pml_crop, -pml_crop)       # 左右都切 pml_crop
+
+        vel = vel_original[:, z_slice, x_slice]
+        UU0 = UU0_original[:, :, z_slice, x_slice]
+        UU = UU_original[:, :, z_slice, x_slice]
+
+        # 更新 args.nz 和 args.nx 为切片后的实际尺寸
+        args.nz = vel.shape[1]  # 实际的 z 维度
+        args.nx = vel.shape[2]  # 实际的 x 维度
     else:
         vel, UU0, UU = vel_original, UU0_original, UU_original
+        # 无 PML 时，使用原始数据尺寸
+        args.nz = vel.shape[1]
+        args.nx = vel.shape[2]
 
     # 3. 震源拆分与训练集生成
     UU_loc = [UU[loc * len(vel) : (loc + 1) * len(vel), ...] for loc in range(5)]
@@ -224,10 +236,17 @@ def prepare_external_val_dataset(args, prefix, loc_target, y_pred_grid):
 
     # 2. PML 边界处理
     if args.pml:
-        Lpml = args.Lpml
-        vel_ext = vel_ext.unsqueeze(0)[:, Lpml:-Lpml, Lpml:-Lpml]
-        UU0_ext = UU0_ext[:, :, Lpml:-Lpml, Lpml:-Lpml]
-        UU_ext = UU_ext[:, :, Lpml:-Lpml, Lpml:-Lpml]
+        pml_crop = args.pml_crop
+        # 根据边界类型确定切片范围
+        if args.boundary_type == 'free_surface':
+            z_slice = slice(0, -pml_crop)
+        else:  # 'full_pml'
+            z_slice = slice(pml_crop, -pml_crop)
+        x_slice = slice(pml_crop, -pml_crop)
+
+        vel_ext = vel_ext.unsqueeze(0)[:, z_slice, x_slice]
+        UU0_ext = UU0_ext[:, :, z_slice, x_slice]
+        UU_ext = UU_ext[:, :, z_slice, x_slice]
     else:
         vel_ext = vel_ext.unsqueeze(0)
 

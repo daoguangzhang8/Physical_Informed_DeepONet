@@ -6,17 +6,27 @@ class Args:
     weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
     save_doc = 'output1'                       # 结果输出文件夹名称
     filename = 'PI_DeepONet_pde'              # 保存的模型前缀名称
+
+    # 训练数据文件名
+    # vel_filename = 'velocity_data_70_70_n1.npy'
+    # backgroundfield_filename = 'backgroundfield_data_freq5_1source_70_70_n1.npy'
+    # wavefield_filename = 'wavefield_data_freq5_5sources_70_70_n1.npy'
+
+    # 自由表面训练数据
+    vel_filename = 'freesurface_velocity_freq5_1source_80_90_n1.npy'
+    backgroundfield_filename = 'freesurface_backgroundfield_freq5_1source_80_90_n1.npy'
+    wavefield_filename = 'freesurface_wavefield_freq5_1sources_80_90_n1.npy'
     
     # 外部泛化测试集配置 (支持动态扩展)
     ext_val_datasets = {
-        'Marmousi': {'prefix': 'marmousi_', 'loc_target': 2},
+        # 'Marmousi': {'prefix': 'marmousi_', 'loc_target': 2},
         # 'BP': {'prefix': 'bp_', 'loc_target': 0},  
     }
     
     # ==========================================
     # 2. 硬件与设备配置 (Hardware & Device)
     # ==========================================
-    device = 2                                # 指定使用的 GPU 设备编号 (cuda:2)
+    device = 3                                # 指定使用的 GPU 设备编号 (cuda:2)
 
     # ==========================================
     # 3. 学习率调度器参数 (Learning Rate Scheduler)
@@ -35,14 +45,20 @@ class Args:
     adjust_speed = 1.1                        # 权重衰减/增长的速度因子
     save_fig_every = 50                       # 每隔多少个 epoch 保存一次验证/测试可视化图片
     save_model_every = 500                    # 每隔多少个 epoch 保存一次模型权重文件
+
+    # ==========================================
+    # 5. 标签来源配置 (Label Source Configuration)
+    # ==========================================
+    use_fno_as_label = False                  # True: 使用 FNO 预测作为软标签 | False: 使用真实标签
+    fno_weights_path = ''                     # FNO 预训练权重路径 (当 use_fno_as_label=True 时需要指定)
     
     # ==========================================
     # 5. 数据集与批处理配置 (Dataset & Dataloader)
     # ==========================================
-    nvel_train = 1                          # 训练所用的速度模型数量
+    nvel_train = 1500                          # 训练所用的速度模型数量
     ny_train = 4900                           # 训练集空间采样点总数
     batch_size = 700                          # Trunk Net 坐标采样批次大小 (num_sample)
-    batch_size_v = 1                          # Branch Net 速度场/背景场批次大小 (Batch_v)
+    batch_size_v = 35                          # Branch Net 速度场/背景场批次大小 (Batch_v)
     
     valid_rate = 0.1                          # 验证集划分比例
     validate_every = 100                      # 每隔多少个 epoch 执行一次模型验证
@@ -50,15 +66,21 @@ class Args:
     valid_batch_size_v = 6                    # 验证集速度场批次大小
     accumulation_steps = 4                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
 
-    source_list = [0,1,2,3,4]
+    source_list = [2]
     # ==========================================
     # 6. 物理网格与边界条件 (Physical Grid & PML Boundaries)
     # ==========================================
     nx = 70                                   # 物理模型 x 方向网格数 (不含外延 PML)
     nz = 70                                   # 物理模型 z 方向网格数 (不含外延 PML)
     pml = True                                # 是否启用 PML (Perfectly Matched Layer, 完美匹配层) 吸收边界
-    Lpml = 9                                  # 实际截取的 PML 层数
-    LD = 10 - Lpml                            # 边界补偿计算参数 (用于适配原始数据与网络输入维度)
+    pml_total = 10                            # PML 吸收层的总网格厚度
+    pml_crop = 5                              # 训练时裁剪/忽略的 PML 网格数
+    pml_active = pml_total - pml_crop         # 剩余参与训练的 PML 网格数
+
+    # 边界类型配置
+    # 'full_pml': 四边 PML 吸收边界，原始数据 90×90 → 网络输入 72×72
+    # 'free_surface': 顶部自由表面 + 其他三边 PML，原始数据 80×90 → 网络输入 71×72
+    boundary_type = 'free_surface'            # 根据实际数据选择
     
     # ==========================================
     # 7. 微调与域适应配置 (Fine-Tuning for Out-of-Distribution)
@@ -73,7 +95,7 @@ class Args:
     # ==========================================
     # 8. 主训练循环超参数 (Main Training Hyperparameters)
     # ==========================================
-    NIter = 100 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
+    NIter = 10000 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
     warmup_epochs = 100                       # 学习率热身 (Warmup) 的 epoch 数
     lr = 1 * 1e-4                             # 初始基础学习率
     weight_decay = 1e-4                       # 优化器权重衰减 (L2 正则化)系数

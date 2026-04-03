@@ -15,9 +15,10 @@ class Pi_DeepONet(nn.Module):
     """
     def __init__(self, args):
         super().__init__()
+        self.args = args  # 保存args以便其他方法使用
         self.device = args.device
         self.feat_dim = 256  # 特征维度，必须能被注意力头数整除
-        
+
         # --- 超参数 ---
         input_shape_branch1 = args.input_shape_branch1
         input_shape_branch2 = args.input_shape_branch2
@@ -146,17 +147,17 @@ class Pi_DeepONet(nn.Module):
         batch_size_v = vel.shape[0]
         batch_size_pts = y.shape[1]
         y_sample = y.expand(batch_size_v, -1, -1)
-        
+
         Z_dim = vel.shape[2]
         X_dim = vel.shape[3]
-        SPATIAL_SCALE = 40.0 
+        SPATIAL_SCALE = 40.0
 
         # --- 1. 坐标归一化与 Grid 构造 ---
         z_pixel = y_sample[:, :, 0] / SPATIAL_SCALE
         x_pixel = y_sample[:, :, 1] / SPATIAL_SCALE
         z_norm = 2 * (z_pixel / (Z_dim - 1)) - 1
         x_norm = 2 * (x_pixel / (X_dim - 1)) - 1
-        
+
         grid = torch.stack([x_norm, z_norm], dim=-1).unsqueeze(1)  # [B_v, 1, B_pts, 2]
 
         # --- 2. 可微双线性插值采样 ---
@@ -168,18 +169,18 @@ class Pi_DeepONet(nn.Module):
         U0_sampled = F.grid_sample(UU0, grid, mode='bilinear', padding_mode='border', align_corners=True).squeeze(2)
         U0_real = U0_sampled[:, 0, :].detach()
         U0_imag = U0_sampled[:, 1, :].detach()
-        
+
         # --- 3. 物理常数与衰减因子准备 ---
         c0 = torch.ones_like(c) * 1.5
         f, f0 = 5, 10
         omega = 2 * np.pi * f * 1e-3
         k = (1 / c) ** 2
         k0 = (1 / c0) ** 2
-        
+
         Q = 15
         alpha = 1 / Q
         rhot = (1 - alpha / np.pi * np.log(f / 50) - 1j * alpha / 2) ** 2
-        
+
         kr, ki = k * np.real(rhot), k * np.imag(rhot)
         k0r, k0i = k0 * np.real(rhot), k0 * np.imag(rhot)
 
@@ -191,12 +192,26 @@ class Pi_DeepONet(nn.Module):
         Delta_U_real, Delta_U_imag = Delta_U[:, :, 0], Delta_U[:, :, 1]
 
         zz, xx = y[:, :, 0], y[:, :, 1]
-        ld = (Z_dim - 70) / 2
+
+        # 修复：使用 pml_active 而不是硬编码计算
+        # 物理区域始终是 70×70（由config.py中的nx, nz定义）
+        # ld 是保留的 PML 网格数（参与训练的PML厚度）
+        ld = self.args.pml_active  # 修复点：从 (Z_dim - 70)/2 改为 pml_active
 
         # PML 边界系数 (detach: 只依赖坐标位置，不需要对网络参数求导)
         with torch.no_grad():
-            lx = F.relu(((ld - 0.5) * 40 - xx) / ((ld - 0.5) * 40)) + F.relu((xx - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
-            lz = F.relu(((ld - 0.5) * 40 - zz) / ((ld - 0.5) * 40)) + F.relu((zz - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
+            # x 方向（水平）: 左右都有 PML（对称）
+            lx = F.relu(((ld - 0.5) * 40 - xx) / ((ld - 0.5) * 40)) + \
+                 F.relu((xx - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
+
+            # z 方向（垂直）: 根据 boundary_type 决定
+            if self.args.boundary_type == 'free_surface':
+                # 自由表面边界：顶部无 PML，只在底部激活
+                lz = F.relu((zz - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
+            else:  # 'full_pml'
+                # 完全 PML 边界：上下都激活
+                lz = F.relu(((ld - 0.5) * 40 - zz) / ((ld - 0.5) * 40)) + \
+                     F.relu((zz - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
 
             pml_tmp1 = C ** 2 * lx ** 2 * lz ** 2
             pml_tmp2 = C ** 2 * lx ** 4
@@ -278,59 +293,93 @@ class Pi_DeepONet(nn.Module):
     
     def get_trunk_output(self, vel, y):
         """独立提取 Trunk 网络的基底输出"""
-        y_norm = 2 * (y - 0) / (40 * 72) - 1 
+        # 修复：使用实际网格尺寸而不是硬编码 72
+        Z_dim = vel.shape[2]
+        X_dim = vel.shape[3]
+        y_norm = 2 * (y - 0) / (40 * X_dim) - 1  # 使用实际x维度
         z_enc = self.pos_encoder(y_norm[:, :, 0:1])
         x_enc = self.pos_encoder(y_norm[:, :, 1:2])
-        
+
         y_encoded = torch.cat([z_enc, x_enc], dim=-1)
         physical_context = get_local_physical_features(vel, y, eps=1e-3)
         y_encoded = torch.cat([y_encoded, physical_context], dim=-1)
-        
+
         return self.trunk(y_encoded)
 
-    def generate_structure_aware_y_ran(self, vel, num_pts=20000, max_z=72.0, max_x=72.0):
+    def generate_structure_aware_y_ran(self, vel, num_pts=20000, max_z=None, max_x=None):
         """
         结构感知自适应采样点生成。
-        根据速度场空间梯度的高低，自适应分配采样点（70% 结构点，30% 均匀点）。
+        根据速度场空间梯度的高低，自适应分配采样点（50% 结构点，50% 表层点）。
+
+        Args:
+            vel: 速度场 [B, C, Z, X]
+            num_pts: 采样点数量
+            max_z: z方向最大坐标（默认使用vel的实际尺寸）
+            max_x: x方向最大坐标（默认使用vel的实际尺寸）
+
+        Returns:
+            y_ran: 采样点坐标 [B, num_pts, 2]，requires_grad=True
         """
+        # 修复：如果未提供max_z和max_x，使用vel的实际尺寸
+        if max_z is None:
+            max_z = float(vel.shape[2]) * 40.0  # 转换为实际坐标
+        if max_x is None:
+            max_x = float(vel.shape[3]) * 40.0
+
         B_v = vel.shape[0]
         device = vel.device
-        
+
+        # 计算网格步长
+        dz = max_z / vel.shape[2]  # z方向网格步长
+        dx = max_x / vel.shape[3]  # x方向网格步长
+
         with torch.no_grad():
             # 计算空间梯度幅度
             grad_z = vel[:, :, 2:, 1:-1] - vel[:, :, :-2, 1:-1]
             grad_x = vel[:, :, 1:-1, 2:] - vel[:, :, 1:-1, :-2]
             vel_grad_mag = torch.sqrt(grad_z**2 + grad_x**2 + 1e-8)
             vel_grad_mag = F.pad(vel_grad_mag, (1, 1, 1, 1), mode='replicate').squeeze(1)
-            
+
             y_ran_list = []
             for b in range(B_v):
                 prob_dist = vel_grad_mag[b].view(-1)
                 prob_dist = prob_dist / (prob_dist.sum() + 1e-8)
-                
-                num_structure = int(num_pts * 0.7)
-                num_uniform = num_pts - num_structure
-                
-                # --- 抽取结构边界点 ---
+
+                # 修改采样策略：50% 结构点，50% 表层点
+                num_structure = int(num_pts * 0.5)
+                num_surface = num_pts - num_structure
+
+                # --- 1. 抽取结构边界点（50%）---
                 if num_structure > 0:
                     sampled_indices = torch.multinomial(prob_dist, num_samples=num_structure, replacement=True)
                     z_idx = sampled_indices // vel.shape[3]
                     x_idx = sampled_indices % vel.shape[3]
-                    
-                    dz, dx = max_z / vel.shape[2], max_x / vel.shape[3]
+
                     z_coords = z_idx.float() * dz + (torch.rand(num_structure, device=device) * dz)
                     x_coords = x_idx.float() * dx + (torch.rand(num_structure, device=device) * dx)
                     y_struct = torch.stack([z_coords, x_coords], dim=1)
                 else:
                     y_struct = torch.empty((0, 2), device=device)
-                    
-                # --- 抽取全局均匀分布点 ---
-                z_uni = torch.rand(num_uniform, device=device) * max_z
-                x_uni = torch.rand(num_uniform, device=device) * max_x
-                y_uni = torch.stack([z_uni, x_uni], dim=1)
-                
-                y_ran_list.append(torch.cat([y_struct, y_uni], dim=0))
-                
+
+                # --- 2. 抽取表层点（50%）---
+                # 表层定义：z < 2 个网格点的深度范围
+                if num_surface > 0:
+                    # 表层深度范围：[0, 2*dz]
+                    surface_depth = 2.0 * dz
+
+                    # 在表层范围内随机采样 z 坐标
+                    z_surf = torch.rand(num_surface, device=device) * surface_depth
+
+                    # x 坐标在整个范围内均匀采样
+                    x_surf = torch.rand(num_surface, device=device) * max_x
+
+                    y_surf = torch.stack([z_surf, x_surf], dim=1)
+                else:
+                    y_surf = torch.empty((0, 2), device=device)
+
+                # 合并结构点和表层点
+                y_ran_list.append(torch.cat([y_struct, y_surf], dim=0))
+
         y_ran = torch.stack(y_ran_list, dim=0)
         return y_ran.requires_grad_(True)
 
@@ -356,7 +405,9 @@ class Pi_DeepONet(nn.Module):
         batch_idx = torch.arange(batch_size_v, device=labels.device)[:, None]
         z_coord = (y[:, :, 0] / 40.0).long().clamp(0, nz - 1)
         x_coord = (y[:, :, 1] / 40.0).long().clamp(0, nx - 1)
-        labels = labels[batch_idx, :, z_coord, x_coord] 
+        # 修复：转置以匹配 pred 的维度顺序 [B_v, B_pts, 2]
+        # print('labels', labels.shape)
+        labels = labels[batch_idx, :, z_coord, x_coord]  # [B_v, 2, B_pts] -> [B_v, B_pts, 2] 
         
         # 2. 生成自适应物理采样点并与原始采样点合并 (减少一次 PDE 计算)
         y_ran = self.generate_structure_aware_y_ran(vel, num_pts=900, max_z=nz, max_x=nx)
