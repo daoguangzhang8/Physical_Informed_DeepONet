@@ -198,9 +198,9 @@ def train(args):
                 vel_pred, UU0_pred, labels_pred = plot_data["vel_pred"], plot_data["UU0_pred"], plot_data["labels_pred"]
                 vel_test, UU0_test, labels_test = plot_data["vel_test"], plot_data["UU0_test"], plot_data["labels_test"]
 
-                # marmousi_data = ext_val_sets['Marmousi']
-                # v_m_test, u0_m_test, lab_m_test = marmousi_data["plot_data"]["v_test"], marmousi_data["plot_data"]["u0_test"], marmousi_data["plot_data"]["lab_test"]
-                # dataloader_m_y_full = marmousi_data["loader"]
+                marmousi_data = ext_val_sets['Marmousi']
+                v_m_test, u0_m_test, lab_m_test = marmousi_data["plot_data"]["v_test"], marmousi_data["plot_data"]["u0_test"], marmousi_data["plot_data"]["lab_test"]
+                dataloader_m_y_full = marmousi_data["loader"]
 
                 plot_loss(i, args.save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss)
                 

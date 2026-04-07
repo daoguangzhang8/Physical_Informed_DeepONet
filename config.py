@@ -4,7 +4,7 @@ class Args:
     # ==========================================
     load_path = '/home/sharedata/zdg'         # 数据集加载根目录
     weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
-    save_doc = 'output1'                       # 结果输出文件夹名称
+    save_doc = 'output'                       # 结果输出文件夹名称
     filename = 'PI_DeepONet_pde'              # 保存的模型前缀名称
 
     # 训练数据文件名
@@ -19,7 +19,7 @@ class Args:
     
     # 外部泛化测试集配置 (支持动态扩展)
     ext_val_datasets = {
-        # 'Marmousi': {'prefix': 'marmousi_', 'loc_target': 2},
+        'Marmousi': {'prefix': 'marmousi_', 'loc_target': 2},
         # 'BP': {'prefix': 'bp_', 'loc_target': 0},  
     }
     
@@ -66,7 +66,7 @@ class Args:
     valid_batch_size_v = 6                    # 验证集速度场批次大小
     accumulation_steps = 4                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
 
-    source_list = [2]
+    source_list = [0, 1, 2, 3, 4]                 # 训练数据中包含的震源编号列表 (0-4 共5个震源)  
     # ==========================================
     # 6. 物理网格与边界条件 (Physical Grid & PML Boundaries)
     # ==========================================
@@ -95,7 +95,7 @@ class Args:
     # ==========================================
     # 8. 主训练循环超参数 (Main Training Hyperparameters)
     # ==========================================
-    NIter = 10000 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
+    NIter = 2000 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
     warmup_epochs = 100                       # 学习率热身 (Warmup) 的 epoch 数
     lr = 1 * 1e-4                             # 初始基础学习率
     weight_decay = 1e-4                       # 优化器权重衰减 (L2 正则化)系数

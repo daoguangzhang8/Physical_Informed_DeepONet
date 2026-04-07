@@ -39,6 +39,7 @@ class Args_test:
     source_list = [2]
     ext_val_datasets = {
         'Marmousi': {'prefix': 'marmousi_', 'loc_target': source_list},
+        'Overtrust': {'prefix': 'overthrust_', 'loc_target': source_list},
         # '1994BP': {'prefix': '1994BP_', 'loc_target': source_list},
         # 'SEAM': {'prefix': 'SEAM_', 'loc_target': source_list},
     }
@@ -126,7 +127,7 @@ class Args_test:
     # 7. 微调与域适应配置
     # ==========================================
     if_finetune = True
-    ft_NIter = 10
+    ft_NIter = 1000
     ft_lr = 2e-5
     ft_a = 0.2
     ft_b = 1

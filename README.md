@@ -2,6 +2,8 @@
 
 基于物理信息神经算子 (Physics-Informed DeepONet) 的 Helmholtz 方程求解器，支持 PML 边界条件与多震源波场预测。
 
+> 📖 **[查看项目改进记录](IMPROVEMENT.md)** - 按时间顺序记录的所有重要改进和修复
+
 ## 项目简介
 
 本项目实现了一个**物理信息约束的 DeepONet** 架构，用于求解带 PML (Perfectly Matched Layer) 吸收边界条件的 **Helmholtz 方程**。模型结合了：
