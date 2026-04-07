@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset
 
 # ==========================================
 # 导入模块 (已移除 FNO)
@@ -14,22 +15,65 @@ from model.PI_DeepOnet import Pi_DeepONet
 from model.FNO import FNO
 from model.plotting import *
 
+# ==========================================
+# Test 相关的辅助函数（从 dataloader.py 移动过来）
+# ==========================================
+
+
 class Args_test:
     # ==========================================
-    # 1. 路径与文件配置
+    # 1. 边界类型配置 (必须最先定义)
     # ==========================================
-    load_path = '/home/sharedata/zdg'         
-    weights_save_path = '/home/sharedata/zdg' 
-    save_doc = 'output_test'                       
-    filename = 'PI_DeepONet_pde'              
+    # 'full_pml': 四边 PML 吸收边界，原始数据 90×90 → 网络输入 72×72
+    # 'free_surface': 顶部自由表面 + 其他三边 PML，原始数据 80×90 → 网络输入 71×72
+    boundary_type = 'free_surface'  # 根据实际数据选择: 'free_surface' 或 'full_pml'
 
-    source_list = [0, 1, 2, 3, 4]
+    # ==========================================
+    # 2. 路径与文件配置
+    # ==========================================
+    load_path = '/home/sharedata/zdg'
+    weights_save_path = '/home/sharedata/zdg'
+    save_doc = 'output_test'
+    filename = 'PI_DeepONet_pde'
+
+    source_list = [2]
     ext_val_datasets = {
-        # 'Marmousi': {'prefix': 'marmousi_', 'loc_target': source_list}, 
-        '1994BP': {'prefix': '1994BP_', 'loc_target': source_list},
+        'Marmousi': {'prefix': 'marmousi_', 'loc_target': source_list},
+        # '1994BP': {'prefix': '1994BP_', 'loc_target': source_list},
         # 'SEAM': {'prefix': 'SEAM_', 'loc_target': source_list},
     }
-    target_epoch = 500
+
+    # ==========================================
+    # 3. 模型权重配置 (完全手动指定，不随 boundary_type 变化)
+    # ==========================================
+    # ⚠️ 注意：无论 boundary_type 是什么，都由你手动指定权重路径
+    # 请确保加载的权重与测试数据匹配！
+    model_weights_path = 'output1/PI_DeepONet_pde_PI_model_1000epoch_weights_75.pth'
+
+    # ==========================================
+    # 4. 根据 boundary_type 自动配置训练数据文件
+    # ==========================================
+    # ✅ 自动根据 boundary_type 选择训练数据文件名
+    if boundary_type == 'free_surface':
+        # freesurface 版本：文件名前缀加 'freesurface_'
+        vel_filename = 'freesurface_velocity_freq5_1source_80_90_n1.npy'
+        backgroundfield_filename = 'freesurface_backgroundfield_freq5_1source_80_90_n1.npy'
+        wavefield_filename = 'freesurface_wavefield_freq5_1sources_80_90_n1.npy'
+    else:  # 'full_pml'
+        # full_pml 版本：使用原始文件名
+        vel_filename = 'velocity_data_70_70_n1.npy'
+        backgroundfield_filename = 'backgroundfield_data_freq5_1source_70_70_n1.npy'
+        wavefield_filename = 'wavefield_data_freq5_5sources_70_70_n1.npy'
+
+    # ==========================================
+    # 5. 外部测试集文件说明
+    # ==========================================
+    # ✅ 外部测试集文件会自动根据 boundary_type 选择文件名
+    # - free_surface: 直接使用 'freesurface_' 前缀
+    #   例如：'freesurface_velocity_data_70_70_n1.npy'
+    # - full_pml: 使用原始文件名（无前缀）
+    #   例如：'velocity_data_70_70_n1.npy'
+    # ⚠️ 注意：外部测试集文件名不包含数据集名称前缀（如 '1994BP_'）
     # ==========================================
     # 2. 硬件与设备配置
     # ==========================================
@@ -67,25 +111,25 @@ class Args_test:
     valid_batch_size_v = 6                    
     accumulation_steps = 2                    
 
-    
+
     # ==========================================
     # 6. 物理网格与边界条件
     # ==========================================
-    nx = 70                                   
-    nz = 70                                   
+    nx = 70
+    nz = 70
     pml = True
     pml_total = 10
-    pml_crop = 9
-    pml_active = pml_total - pml_crop                            
-    
+    pml_crop = 5
+    pml_active = pml_total - pml_crop
+
     # ==========================================
     # 7. 微调与域适应配置
     # ==========================================
-    if_finetune = True                        
-    ft_NIter = 1000                             
-    ft_lr = 2e-5                              
-    ft_a = 0.2                                
-    ft_b = 1                                  
+    if_finetune = True
+    ft_NIter = 10
+    ft_lr = 2e-5
+    ft_a = 0.2
+    ft_b = 1
     ft_c = 0.1                                  
     
     # ==========================================
@@ -112,6 +156,129 @@ class Args_test:
     input_shape_branch1 = (batch_size, in_channels_vel, nz, nx) 
     input_shape_branch2 = (batch_size, in_channels, nz, nx)     
 
+    
+def Test_data_single(args, loc_idx, vel_single, UU_loc_single, UU0_loc_single):
+    """
+    专门用于加载测试模型（如 Marmousi），支持自适应单震源或多震源并发输入。
+    """
+    # 1. 基本参数准备
+    spatial_step = 40
+    nz, nx = vel_single.shape[-2], vel_single.shape[-1]
+
+    # 确保输入是 Tensor
+    if isinstance(vel_single, np.ndarray):
+        vel_single = torch.from_numpy(vel_single)
+    if isinstance(UU_loc_single, np.ndarray):
+        UU_loc_single = torch.from_numpy(UU_loc_single)
+    if isinstance(UU0_loc_single, np.ndarray):
+        UU0_loc_single = torch.from_numpy(UU0_loc_single)
+
+    # ==========================================
+    # 核心修改点：自适应维度推导
+    # ==========================================
+    # 2. 提取波场数据，利用 -1 自动推导包含的震源数量 (num_sources)
+    u_current = UU_loc_single.view(-1, 2, nz, nx).float()
+    u0_current = UU0_loc_single.view(-1, 2, nz, nx).float()
+
+    num_sources = u_current.shape[0]  # 获取实际传进来的震源数量 (例如 1 或 5)
+
+    # 3. 速度模型处理
+    # 速度模型本身只有 1 个，为了能放进 Dataloader，必须复制成 num_sources 份与波场对齐
+    vel_test = vel_single.view(1, 1, nz, nx).expand(num_sources, -1, -1, -1).float()
+
+    # 4. 计算标签 (UU - UU0) -> [num_sources, 2, NZ, NX]
+    labels_test = u_current - u0_current
+
+    # ==========================================
+    # 坐标点采样
+    # ==========================================
+    # 生成全空间网格
+    x_c = torch.arange(0, nx)
+    z_c = torch.arange(0, nz)
+    grid_z, grid_x = torch.meshgrid(z_c, x_c, indexing='ij')
+
+    # 展平成 [NZ*NX, 2]
+    y_grid = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1).float() * spatial_step
+
+    # 同样地，网格坐标也需要扩展成 num_sources 份，变成 [num_sources, NZ*NX, 2]
+    y_test = y_grid.unsqueeze(0).expand(num_sources, -1, -1)
+
+    # 返回参数顺序与原函数保持一致
+    return vel_test, u_current, u0_current, y_test, labels_test
+
+
+def prepare_external_val_dataset(args, prefix, loc_target, y_pred_grid):
+    """
+    通用接口：用于动态加载和处理单个外部验证集（如 Marmousi, BP 等）
+    根据 boundary_type 自动选择文件名：
+    - free_surface: 使用 'freesurface_{prefix}_' 前缀
+    - full_pml: 使用 '{prefix}_' 前缀
+
+    注意：prefix 可以带或不带下划线，代码会自动处理
+    """
+    # 去除 prefix 末尾的下划线（如果有的话）
+    prefix = prefix.rstrip('_')
+
+    # 根据 boundary_type 确定文件名前缀
+    if args.boundary_type == 'free_surface':
+        # freesurface 版本：在数据集名称前加 'freesurface_'
+        file_prefix = f'freesurface_{prefix}_'
+    else:  # 'full_pml'
+        # full_pml 版本：直接使用数据集名称前缀
+        file_prefix = f'{prefix}_'
+
+    # 1. 读取外部测试集数据
+    print(f'[*] 正在加载外部验证集: {prefix}')
+    print(f'    - 文件前缀: {file_prefix}')
+
+    vel_ext = load_tensor_from_npy(args.load_path, f'{file_prefix}velocity_data_70_70_n1.npy')
+    UU0_ext = load_tensor_from_npy(args.load_path, f'{file_prefix}backgroundfield_data_freq5_1source_70_70_n1.npy')
+    UU_ext = load_tensor_from_npy(args.load_path, f'{file_prefix}wavefield_data_freq5_5sources_70_70_n1.npy')
+
+    # 2. PML 边界处理
+    if args.pml:
+        pml_crop = args.pml_crop
+        # 根据边界类型确定切片范围
+        if args.boundary_type == 'free_surface':
+            z_slice = slice(0, -pml_crop)
+        else:  # 'full_pml'
+            z_slice = slice(pml_crop, -pml_crop)
+        x_slice = slice(pml_crop, -pml_crop)
+
+        vel_ext = vel_ext.unsqueeze(0)[:, z_slice, x_slice]
+        UU0_ext = UU0_ext[:, :, z_slice, x_slice]
+        UU_ext = UU_ext[:, :, z_slice, x_slice]
+    else:
+        vel_ext = vel_ext.unsqueeze(0)
+
+    # 3. 截取目标震源位置
+    num_samples = len(vel_ext)
+    if isinstance(loc_target, list):
+        m_uu_single = torch.cat([UU_ext[loc * num_samples : (loc + 1) * num_samples] for loc in loc_target], dim=0)
+        m_uu0_single = torch.cat([UU0_ext[loc * num_samples : (loc + 1) * num_samples] for loc in loc_target], dim=0)
+    else:
+        m_uu_single = UU_ext[loc_target * num_samples : (loc_target + 1) * num_samples]
+        m_uu0_single = UU0_ext[loc_target * num_samples : (loc_target + 1) * num_samples]
+
+    # 4. 生成测试格式数据
+    v_test, u_test, u0_test, y_test, lab_test = Test_data_single(
+        args, loc_target, vel_ext, m_uu_single, m_uu0_single
+    )
+
+    # 5. 归一化对齐训练逻辑
+    v_test = v_test / 1000.0
+
+    # 6. 生成专用的 DataLoader 和绘图数据字典
+    ext_loader = DataLoader(TensorDataset(y_pred_grid), batch_size=args.batch_size, shuffle=False)
+
+    ext_plot_data = {
+        "v_test": v_test,
+        "u0_test": u0_test,
+        "lab_test": lab_test
+    }
+
+    print(f'    ✓ 外部数据集准备完成: vel_shape {v_test.shape}')
+    return ext_loader, ext_plot_data
 # ==============================================================================
 # 核心数据提取与画图函数
 # ==============================================================================
@@ -183,10 +350,16 @@ def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, 
         eval_model = model  # 不微调，使用原模型
         
     eval_model.eval()
-    
+
+    # 根据边界类型确定裁切范围
     L = args.pml_active
-    slc = slice(L, -L) if L > 0 else slice(None)
-    
+    if args.boundary_type == 'free_surface':
+        z_slc = slice(0, -L) if L > 0 else slice(None)    # 顶部不切，底部切 L
+    else:  # 'full_pml'
+        z_slc = slice(L, -L) if L > 0 else slice(None)    # 上下都切 L
+
+    x_slc = slice(L, -L) if L > 0 else slice(None)        # 左右都切 L
+
     fig_real, axes_real = plt.subplots(3, num_sources, figsize=(3.5 * num_sources, 10))
     fig_imag, axes_imag = plt.subplots(3, num_sources, figsize=(3.5 * num_sources, 10))
     
@@ -215,24 +388,24 @@ def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, 
                 
             pred_concat = torch.cat(u_pred_list, dim=1)
             pred_np = pred_concat[0].view(grid_nz, grid_nx, 2).cpu().numpy()
-            
-            pred_real = pred_np[slc, slc, 0]
-            pred_imag = pred_np[slc, slc, 1]
-            
-            true_np = curr_label.squeeze().cpu().numpy() 
-            target_shape = pred_real.shape[0] 
-            
+
+            pred_real = pred_np[z_slc, x_slc, 0]
+            pred_imag = pred_np[z_slc, x_slc, 1]
+
+            true_np = curr_label.squeeze().cpu().numpy()
+            target_shape = pred_real.shape[0]
+
             if true_np.shape[0] == 2:
-                if true_np.shape[1] > target_shape: 
-                    true_real = true_np[0, slc, slc]
-                    true_imag = true_np[1, slc, slc]
+                if true_np.shape[1] > target_shape:
+                    true_real = true_np[0, z_slc, x_slc]
+                    true_imag = true_np[1, z_slc, x_slc]
                 else:
                     true_real = true_np[0, :, :]
                     true_imag = true_np[1, :, :]
-            else: 
-                if true_np.shape[0] > target_shape: 
-                    true_real = true_np[slc, slc, 0]
-                    true_imag = true_np[slc, slc, 1]
+            else:
+                if true_np.shape[0] > target_shape:
+                    true_real = true_np[z_slc, x_slc, 0]
+                    true_imag = true_np[z_slc, x_slc, 1]
                 else:
                     true_real = true_np[:, :, 0]
                     true_imag = true_np[:, :, 1]
@@ -303,7 +476,7 @@ def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, 
 # 核心测试流程 (完全去除 Dataloader 依赖的纯 Tensor 版本)
 # ==============================================================================
 
-def test(args, target_epoch, custom_weights_path=None):
+def test(args, custom_weights_path=None):
     try:
         device = torch.device(f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu')
         print(f"\n========== 开始测试评估模式 | 设备: {device} ==========")
@@ -311,20 +484,37 @@ def test(args, target_epoch, custom_weights_path=None):
         # ---------------------------------------------------------
         # 1. 基础数据准备与拆分 (纯 Tensor 操作)
         # ---------------------------------------------------------
-        vel_original = load_tensor_from_npy(args.load_path, 'velocity_data_70_70_n1.npy')
-        UU0_original = load_tensor_from_npy(args.load_path, 'backgroundfield_data_freq5_1source_70_70_n1.npy')
-        UU_original = load_tensor_from_npy(args.load_path, 'wavefield_data_freq5_5sources_70_70_n1.npy')
-        
-        args.nx = args.nx + args.pml_active * 2
-        args.nz = args.nz + args.pml_active * 2
+        print(f"\n[*] 边界类型: {args.boundary_type}")
+        print(f"[*] 加载数据文件:")
+        print(f"    - 速度场: {args.vel_filename}")
+        print(f"    - 背景场: {args.backgroundfield_filename}")
+        print(f"    - 波场: {args.wavefield_filename}")
+
+        vel_original = load_tensor_from_npy(args.load_path, args.vel_filename)
+        UU0_original = load_tensor_from_npy(args.load_path, args.backgroundfield_filename)
+        UU_original = load_tensor_from_npy(args.load_path, args.wavefield_filename)
 
         if args.pml:
             pml_crop = args.pml_crop
-            vel = vel_original[:, pml_crop:-pml_crop, pml_crop:-pml_crop]
-            UU0 = UU0_original[:, :, pml_crop:-pml_crop, pml_crop:-pml_crop]
-            UU = UU_original[:, :, pml_crop:-pml_crop, pml_crop:-pml_crop]
+            # 根据边界类型确定切片范围
+            if args.boundary_type == 'free_surface':
+                z_slice = slice(0, -pml_crop)      # 顶部不切，底部切 pml_crop
+            else:  # 'full_pml'
+                z_slice = slice(pml_crop, -pml_crop)   # 上下都切 pml_crop
+
+            x_slice = slice(pml_crop, -pml_crop)       # 左右都切 pml_crop
+
+            vel = vel_original[:, z_slice, x_slice]
+            UU0 = UU0_original[:, :, z_slice, x_slice]
+            UU = UU_original[:, :, z_slice, x_slice]
+
+            # 更新为切片后的实际尺寸
+            args.nz = vel.shape[1]  # 实际的 z 维度 (71 for free_surface, 72 for full_pml)
+            args.nx = vel.shape[2]  # 实际的 x 维度 (72)
         else:
             vel, UU0, UU = vel_original, UU0_original, UU_original
+            args.nz = vel.shape[1]
+            args.nx = vel.shape[2]
     
         UU_loc = [UU[loc * len(vel) : (loc + 1) * len(vel), ...] for loc in range(5)]
         UU0_loc = [UU0[loc * len(vel) : (loc + 1) * len(vel), ...] for loc in range(5)]
@@ -362,26 +552,35 @@ def test(args, target_epoch, custom_weights_path=None):
         # 3. 模型初始化与权重加载
         # ---------------------------------------------------------
         model = Pi_DeepONet(args).to(device)
-        
+
         fno = FNO(args).to(device)
         # fno.load_state_dict(torch.load('FNO_bad_PI_model_100epoch_weights.pth', map_location=device)['model_state_dict'])
         fno.eval() # FNO 仅作推断生成 labels，设为评估模式
-        
+
+        # 权重路径优先级：custom_weights_path > model_weights_path
         if custom_weights_path:
             model_path = custom_weights_path
+            print(f"[*] 使用自定义权重路径: {model_path}")
+        elif hasattr(args, 'model_weights_path') and args.model_weights_path:
+            model_path = args.model_weights_path
+            print(f"[*] 使用配置文件指定的权重: {model_path}")
         else:
-            model_path = os.path.join(args.save_doc, f'{args.filename}_PI_model_{target_epoch}epoch_weights_72.pth')
-            
-        print(f"[*] 正在加载 PI_DeepONet 权重: {model_path}")
+            raise ValueError("未指定模型权重路径！请在 Args_test 中设置 model_weights_path 或通过 custom_weights_path 参数传入")
+
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"找不到指定的权重文件: {model_path}，请检查 target_epoch 是否正确。")
-            
+            raise FileNotFoundError(f"找不到指定的权重文件: {model_path}\n请检查 model_weights_path 是否正确")
+
         checkpoint = torch.load(model_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
-        
-        y_grid_tensor = y_valid.unsqueeze(0).to(device) 
-        
+
+        print(f"✅ 成功加载模型权重！")
+
+        # 从权重文件名中提取 epoch 编号 (用于显示)
+        import re
+        epoch_match = re.search(r'(\d+)epoch', model_path)
+        epoch_num = int(epoch_match.group(1)) if epoch_match else 0
+
         # ---------------------------------------------------------
         # 4. 可视化绘图与评估计算 (合并执行)
         # ---------------------------------------------------------
@@ -394,7 +593,7 @@ def test(args, target_epoch, custom_weights_path=None):
             UU0_list=[u.to(device) for u in valid_plot_data["UU0_list"]],
             labels_list=[l.to(device) for l in valid_plot_data["labels_list"]],
             # y_full_grid=y_grid_tensor,
-            epoch=target_epoch,
+            epoch=epoch_num,
             save_doc=args.save_doc,
             filename_prefix="Valid_Set_Model"
         )
@@ -406,7 +605,7 @@ def test(args, target_epoch, custom_weights_path=None):
             UU0_list=[u.to(device) for u in train_plot_data["UU0_list"]],
             labels_list=[l.to(device) for l in train_plot_data["labels_list"]],
             # y_full_grid=y_grid_tensor,
-            epoch=target_epoch,
+            epoch=epoch_num,
             save_doc=args.save_doc,
             filename_prefix="Train_Set_Model"
         )
@@ -422,23 +621,23 @@ def test(args, target_epoch, custom_weights_path=None):
                 lab_ext_test = ext_data["lab_test"].to(device) 
                 
                 num_ext_sources = u0_ext_test.shape[0]
-                ext_vel_single = v_ext_test[0:1] 
+                ext_vel_single = v_ext_test[0:1]
                 ext_UU0_list = [u0_ext_test[i:i+1] for i in range(num_ext_sources)]
                 ext_labels_list = [lab_ext_test[i:i+1] for i in range(num_ext_sources)]
-                
+
                 # 1. 直接推理 (Direct Inference - No FineTuning)
                 plot_single_velocity_multi_sources(
                     args, model, vel=ext_vel_single, UU0_list=ext_UU0_list, labels_list=ext_labels_list,
-                    epoch=target_epoch, save_doc=args.save_doc, filename_prefix=f"External_{dataset_name}",
+                    epoch=epoch_num, save_doc=args.save_doc, filename_prefix=f"External_{dataset_name}",
                     if_fine_tune=False, fno=None
                 )
-                
+
                 # 2. 域适应微调 (Fine-Tuning)
                 if args.if_finetune:
                     plot_single_velocity_multi_sources(
                         args, model, vel=ext_vel_single, UU0_list=ext_UU0_list, labels_list=ext_labels_list,
-                        epoch=target_epoch, save_doc=args.save_doc, filename_prefix=f"External_{dataset_name}",
-                        if_fine_tune=True, fno=fno 
+                        epoch=epoch_num, save_doc=args.save_doc, filename_prefix=f"External_{dataset_name}",
+                        if_fine_tune=True, fno=fno
                     )
 
         print(f"\n========== 测试流程完毕！可视化结果已保存至: {args.save_doc} ==========")
@@ -459,8 +658,8 @@ def main():
             print(f"警告：GPU内存 {gpu_memory:.1f}GB 小于最小要求 {min_gpu_memory}GB，可能导致OOM")
     else:
         print("未找到可用GPU，将使用CPU训练")
-    
-    test(args, args.target_epoch) 
+
+    test(args) 
 
 if __name__ == "__main__":
     torch.cuda.empty_cache() 
