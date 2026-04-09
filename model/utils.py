@@ -105,14 +105,255 @@ def count_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())
     return total_params
 
-# 分布式训练初始化
-def setup(rank, world_size):
+# ==========================================
+# 单机多卡并行训练工具函数 (Single-Machine Multi-GPU)
+# ==========================================
+
+def setup_distributed(rank, world_size):
+    """
+    初始化单机多卡分布式训练环境
+
+    Args:
+        rank: 当前进程的 rank (0, 1, 2, ...)
+        world_size: 总进程数 (等于 GPU 数量)
+    """
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    os.environ['MASTER_PORT'] = '29500'
+
+    # 初始化进程组 (单机固定使用 nccl 后端)
+    dist.init_process_group('nccl', rank=rank, world_size=world_size)
+
+    # 设置当前设备
+    torch.cuda.set_device(rank)
+
+    print(f"[Rank {rank}] 单机多卡训练环境初始化完成 | GPU: {rank}/{world_size}")
+
+
+def cleanup_distributed():
+    """清理分布式训练环境"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+        print("分布式训练环境已清理")
+
+
+def get_available_gpus(min_memory_mb=10240, require_count=None):
+    """
+    检测满足内存要求的可用 GPU
+
+    Args:
+        min_memory_mb: GPU 最小可用内存 (MB)，低于此值的 GPU 不会被选中
+        require_count: 需要的 GPU 数量，若可用 GPU 不足则返回空列表
+
+    Returns:
+        list: 可用 GPU 的编号列表
+    """
+    import subprocess
+
+    available_gpus = []
+    gpu_info = []
+
+    try:
+        # 使用 nvidia-smi 获取 GPU 信息
+        result = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,memory.total,memory.free,utilization.gpu",
+             "--format=csv,nounits,noheader"],
+            encoding="utf-8"
+        )
+
+        for line in result.strip().split("\n"):
+            parts = [x.strip() for x in line.split(",")]
+            idx = int(parts[0])
+            total_mb = int(parts[1])
+            free_mb = int(parts[2])
+            util = int(parts[3]) if len(parts) > 3 else 0
+
+            gpu_info.append({
+                'index': idx,
+                'total_mb': total_mb,
+                'free_mb': free_mb,
+                'utilization': util
+            })
+
+            # 检查是否满足最小内存要求
+            if free_mb >= min_memory_mb:
+                available_gpus.append(idx)
+
+        # 打印 GPU 状态信息
+        print("=" * 60)
+        print("GPU 状态检测报告")
+        print("=" * 60)
+        for info in gpu_info:
+            status = "✅ 可用" if info['index'] in available_gpus else "❌ 不可用"
+            print(f"GPU {info['index']}: 总内存 {info['total_mb']}MB | "
+                  f"可用 {info['free_mb']}MB | 利用率 {info['utilization']}% | {status}")
+        print(f"\n最小内存要求: {min_memory_mb}MB")
+        print(f"可用 GPU 数量: {len(available_gpus)} / {len(gpu_info)}")
+        print("=" * 60)
+
+        # 检查 GPU 数量是否满足要求
+        if require_count is not None and len(available_gpus) < require_count:
+            print(f"⚠️ 警告: 需要 {require_count} 个 GPU，但只有 {len(available_gpus)} 个可用")
+            return []
+
+        return available_gpus
+
+    except Exception as e:
+        print(f"⚠️ 获取 GPU 信息失败: {e}")
+        print("使用 PyTorch 备用检测方法...")
+
+        # Fallback: 使用 PyTorch 检测
+        if not torch.cuda.is_available():
+            print("❌ CUDA 不可用")
+            return []
+
+        for i in range(torch.cuda.device_count()):
+            prop = torch.cuda.get_device_properties(i)
+            total_memory_mb = prop.total_memory / (1024 * 1024)
+
+            try:
+                torch.cuda.set_device(i)
+                allocated_mb = torch.cuda.memory_allocated(i) / (1024 * 1024)
+                free_mb = total_memory_mb - allocated_mb
+            except:
+                free_mb = total_memory_mb * 0.8
+
+            if free_mb >= min_memory_mb:
+                available_gpus.append(i)
+                print(f"GPU {i}: 可用内存约 {free_mb:.0f}MB ✅")
+            else:
+                print(f"GPU {i}: 可用内存约 {free_mb:.0f}MB ❌ (低于 {min_memory_mb}MB)")
+
+        return available_gpus
+
+
+def select_gpus_for_training(args):
+    """
+    根据配置参数自动选择 GPU
+
+    Args:
+        args: 配置参数对象，应包含:
+            - use_parallel: 是否启用并行
+            - num_gpus: 使用的 GPU 数量
+            - min_gpu_memory: GPU 最小内存 (MB)
+            - device: 单 GPU 模式下的设备编号
+
+    Returns:
+        tuple: (selected_gpus, world_size)
+    """
+    use_parallel = getattr(args, 'use_parallel', False)
+    num_gpus = getattr(args, 'num_gpus', 1)
+    min_gpu_memory = getattr(args, 'min_gpu_memory', 10240)
+
+    if not use_parallel:
+        # 单 GPU 模式
+        selected_gpus = [args.device] if hasattr(args, 'device') else [0]
+        print(f"单 GPU 模式: 使用 GPU {selected_gpus[0]}")
+        return selected_gpus, 1
+
+    # 并行模式: 自动检测可用 GPU
+    available_gpus = get_available_gpus(min_memory_mb=min_gpu_memory)
+
+    if len(available_gpus) < num_gpus:
+        print(f"⚠️ 可用 GPU 不足 ({len(available_gpus)} < {num_gpus})，回退到单 GPU 模式")
+        selected_gpus = available_gpus[:1] if available_gpus else [args.device]
+        return selected_gpus, 1
+
+    # 选择指定数量的 GPU
+    selected_gpus = available_gpus[:num_gpus]
+    world_size = len(selected_gpus)
+
+    print(f"单机多卡模式: 使用 {world_size} 个 GPU -> {selected_gpus}")
+    return selected_gpus, world_size
+
+
+def wrap_model_for_distributed(model, rank):
+    """
+    将模型包装为分布式并行模型 (DDP)
+
+    Args:
+        model: 原始模型
+        rank: 当前进程的 rank
+
+    Returns:
+        DDP 包装后的模型
+    """
+    import torch.nn.parallel.distributed as DDP
+
+    model = model.to(rank)
+    model = DDP.DistributedDataParallel(model, device_ids=[rank])
+
+    return model
+
+
+def is_main_process(rank=None):
+    """
+    检查当前是否为主进程
+
+    Args:
+        rank: 进程 rank，若为 None 则自动获取
+
+    Returns:
+        bool: 是否为主进程
+    """
+    if rank is None:
+        if dist.is_initialized():
+            rank = dist.get_rank()
+        else:
+            return True
+
+    return rank == 0
+
+
+def reduce_tensor(tensor, op=dist.ReduceOp.SUM):
+    """
+    跨进程归约张量 (All-Reduce)
+
+    Args:
+        tensor: 待归约的张量
+        op: 归约操作 (SUM, AVG, MAX, MIN)
+
+    Returns:
+        归约后的张量
+    """
+    if not dist.is_initialized():
+        return tensor
+
+    tensor = tensor.clone()
+    dist.all_reduce(tensor, op=op)
+    if op == dist.ReduceOp.SUM:
+        tensor /= dist.get_world_size()
+
+    return tensor
+
+
+def gather_tensor(tensor):
+    """
+    跨进程收集张量 (All-Gather)
+
+    Args:
+        tensor: 待收集的张量
+
+    Returns:
+        拼接后的张量
+    """
+    if not dist.is_initialized():
+        return tensor
+
+    gathered = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, tensor)
+
+    return torch.cat(gathered, dim=0)
+
+
+# 保留旧版函数以兼容
+def setup(rank, world_size):
+    """兼容旧版 setup 函数"""
+    setup_distributed(rank, world_size)
+
 
 def cleanup():
-    dist.destroy_process_group()
+    """兼容旧版 cleanup 函数"""
+    cleanup_distributed()
 
 def calculate_regression_metrics(pred, true):
     """
@@ -260,47 +501,4 @@ def get_helmholtz_spatial_weights(coords, velocity, omega, source_loc, alpha=0.1
     weights = operator_term * (source_anchor + 1e-2)
     
     return weights
-    
-def get_available_gpus(min_memory_gb=19):
-    """结合nvidia-smi命令获取更准确的GPU内存信息"""
-    import subprocess
-    import re
-    
-    min_memory_bytes = min_memory_gb * 1024 * 1024 * 1024
-    available_gpus = []
-    
-    try:
-        # 调用nvidia-smi获取GPU内存信息
-        result = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,memory.total,memory.free", "--format=csv,nounits,noheader"],
-            encoding="utf-8"
-        )
-        
-        for line in result.strip().split("\n"):
-            idx, total, free = map(int, re.findall(r"\d+", line))
-            # 转换为字节
-            free_bytes = free * 1024 * 1024
-            if free_bytes >= min_memory_bytes:
-                available_gpus.append(str(idx))
-                
-        return available_gpus
-    except Exception as e:
-        print(f"获取GPU信息失败，使用备用方法: {e}")
-        # fallback到PyTorch的检测方法
-        if not torch.cuda.is_available():
-            return []
-            
-        for i in range(torch.cuda.device_count()):
-            prop = torch.cuda.get_device_properties(i)
-            total_memory = prop.total_memory
-            try:
-                allocated_memory = torch.cuda.memory_allocated(i)
-                free_memory = total_memory - allocated_memory
-            except:
-                free_memory = total_memory * 0.8
-                
-            if free_memory >= min_memory_bytes:
-                available_gpus.append(str(i))
-        
-        return available_gpus
-        
+

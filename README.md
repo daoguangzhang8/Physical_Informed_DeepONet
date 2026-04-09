@@ -34,14 +34,17 @@ Physical_Informed_DeepONet/
 ├── Labconfig.py          # 实验室通用配置
 ├── model/
 │   ├── PI_DeepOnet.py    # PI-DeepONet 主模型定义
-│   ├── train.py          # 训练循环逻辑
+│   ├── train.py          # 单 GPU 训练循环逻辑
+│   ├── train_distributed.py  # 多 GPU 分布式训练模块
 │   ├── dataloader.py     # 数据加载与预处理
 │   ├── net_module.py     # 网络组件 (FNO, Attention, FiLM等)
 │   ├── plotting.py       # 可视化绘图工具
-│   ├── utils.py          # 通用工具函数
+│   ├── utils.py          # 通用工具函数 (含分布式工具)
 │   └── FNO.py            # FNO 基准模型
 ├── output*/              # 训练输出目录 (自动生成)
-└── README.md
+├── README.md             # 项目说明文档
+├── IMPROVEMENT.md        # 改进记录文档
+└── PARALLEL_USAGE.md     # 多 GPU 并行训练详细指南
 ```
 
 ## 环境要求
@@ -83,14 +86,37 @@ class Args:
     nvel_train = 1500             # 训练样本数
     batch_size = 700              # 坐标采样批次
     batch_size_v = 35             # 速度场批次
-    NIter = 10000               # 训练轮数
+    NIter = 10000                 # 训练轮数
 ```
 
 ### 3. 开始训练
 
+#### 单 GPU 训练
+
+```python
+# config.py
+use_parallel = False
+device = 0                        # 指定 GPU 编号
+```
+
 ```bash
 python main2.py
 ```
+
+#### 单机多 GPU 并行训练
+
+```python
+# config.py
+use_parallel = True               # 启用多 GPU 并行
+num_gpus = 2                      # 使用的 GPU 数量
+min_gpu_memory = 10 * 1024        # GPU 最小可用内存 (MB)
+```
+
+```bash
+python main2.py                   # 自动启动多进程，无需 torchrun
+```
+
+> 💡 **提示**: 多 GPU 训练时，程序会自动检测满足 `min_gpu_memory` 要求的 GPU，若可用 GPU 不足则自动回退到单 GPU 模式。
 
 ### 4. 模型测试
 
@@ -99,6 +125,14 @@ python test.py
 ```
 
 ## 配置参数说明
+
+### 单机多卡并行配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `use_parallel` | False | 是否启用多 GPU 并行训练 |
+| `num_gpus` | 2 | 使用的 GPU 数量 |
+| `min_gpu_memory` | 10240 | GPU 最小可用内存 (MB)，低于此值的 GPU 不会被使用 |
 
 ### 数据与批次配置
 
@@ -212,6 +246,44 @@ output/
 ├── loss_pde_log.npy               # PDE 损失记录
 └── *.png                           # 可视化图片
 ```
+
+## 多 GPU 并行训练
+
+本项目支持单机多卡分布式训练，使用 `torch.multiprocessing.spawn` 内部启动多进程。
+
+### 使用方法
+
+1. **配置参数** (`config.py`)：
+```python
+use_parallel = True               # 启用多 GPU 并行
+num_gpus = 2                      # GPU 数量
+min_gpu_memory = 10 * 1024        # 最小可用内存 (MB)
+```
+
+2. **启动训练**：
+```bash
+python main2.py                   # 无需 torchrun，自动启动多进程
+```
+
+### 工作原理
+
+```
+main2.py
+    │
+    ├── use_parallel = False ──→ model/train.py (单 GPU)
+    │
+    └── use_parallel = True  ──→ model/train_distributed.py
+                                        │
+                                        └── mp.spawn() 启动 N 个进程
+```
+
+### 注意事项
+
+- **Batch Size**: 多 GPU 时，实际 batch size = `batch_size * num_gpus`
+- **模型保存**: 只在主进程保存，访问原始模型需用 `model.module`
+- **数据加载**: 使用 `DistributedSampler` 确保数据不重复
+
+详细说明请参阅 [PARALLEL_USAGE.md](PARALLEL_USAGE.md)
 
 ## 外部数据集测试
 
