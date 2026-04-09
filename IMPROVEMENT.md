@@ -12,6 +12,7 @@
 4. [2026-04-03: DataLoss 失效问题修复](#2026-04-03-dataloss-失效问题修复)
 5. [2026-04-03: 完整修复总结](#2026-04-03-完整修复总结)
 6. [2026-04-03: 结构感知采样改进](#2026-04-03-结构感知采样改进)
+7. [2026-04-09: 配置参数化与多频率支持](#2026-04-09-配置参数化与多频率支持)
 
 ---
 
@@ -578,5 +579,91 @@ YYYY-MM-DD
 
 ---
 
-**最后更新**: 2026-04-07
+## 2026-04-09: 配置参数化与多频率支持
+
+### 改进概述
+
+对项目进行全面参数化改造，消除硬编码常量，并引入多频率训练支持。
+
+### 主要改进
+
+#### 1. 空间点采样模式可配置
+
+**问题**: 训练时坐标点只能使用全网格采样，无法灵活控制采样策略。
+
+**方案**: 在 `config.py` 中新增采样模式参数，支持全网格和 Halton 准随机采样两种模式。
+
+```python
+# config.py 新增
+sampling_mode = 'full_grid'          # 'full_grid' | 'halton'
+halton_sample_ratio = 0.2            # Halton 采样比例（20% 的网格点）
+```
+
+**影响文件**: `config.py`, `model/dataloader.py`
+
+**兼容性**: 默认 `full_grid` 模式，行为与改动前一致。
+
+#### 2. 空间网格间距参数化 (`dh`)
+
+**问题**: 网格间距 `40` 在 `PI_DeepOnet.py`、`dataloader.py`、`plotting.py`、`net_module.py`、`test.py` 中硬编码超过 20 处。
+
+**方案**: 在 `config.py` 中统一定义 `dh = 40`，全项目引用该参数。
+
+```python
+# config.py 新增
+dh = 40    # 空间网格间距 (m)，物理坐标 = 网格索引 * dh
+```
+
+**改动明细**:
+
+| 文件 | 硬编码位置 | 替换为 |
+|------|-----------|--------|
+| `model/dataloader.py` | `spatial_step = 40` (2处), `* 40` (1处) | `args.dh` |
+| `model/PI_DeepOnet.py` | 坐标归一化、SPATIAL_SCALE、PML边界(6处)、采样点生成、标签索引(2处) | `self.args.dh` |
+| `model/net_module.py` | `GaussianWeightedLayer` 中 `/ 40` (2处) | `self.dh` (构造函数新增 `dh` 参数) |
+| `model/plotting.py` | `spatial_step = 40.`, `70 * 40` (2处) | `args.dh` |
+| `test.py` | `spatial_step = 40`, `* 40` | `args.dh` |
+
+#### 3. 多频率训练支持
+
+**问题**: PDE Loss 中频率 `f=5` 硬编码，无法进行多频率训练。
+
+**方案**: 引入频率数据文件，每个速度模型对应一个频率值，通过数据流传递到 PDE Loss 计算中。
+
+```python
+# config.py 新增
+freq_filename = 'freesurface_freq_data_80_90_n1.npy'   # 频率数据 [N_vel]
+default_freq = 5.0                                       # 默认频率 (Hz)
+```
+
+**数据关系**: 每个速度模型 (vel) 对应 1 个 freq + 5 个震源的波场 (UU/UU0)。
+
+**数据流**:
+
+```
+freq.npy [N_vel]
+  → load → Training_data(按5震源扩展) [5×N_vel]
+    → TensorDataset(vel, UU0, labels, freq)
+      → train.py 解包 freq_batch [B_v]
+        → model.loss(freq_batch=...)
+          → loss_PDE_Scatter_pml(freq_batch=...)
+            → f = freq_batch (替换硬编码 f=5)
+```
+
+**影响文件**:
+
+| 文件 | 改动 |
+|------|------|
+| `config.py` | 新增 `freq_filename`, `default_freq` |
+| `model/dataloader.py` | 加载 freq、按震源扩展、条件性加入 DataLoader |
+| `model/train.py` | 从 batch 解包 freq，传递给 `model.loss()` |
+| `model/PI_DeepOnet.py` | `loss()` 和 `loss_PDE_Scatter_pml()` 新增 `freq_batch` 参数 |
+| `model/plotting.py` | `test_plot()` 和 `fine_tuning()` 透传 `freq` |
+| `test.py` | `Args_test` 新增 `freq_filename`，`plot_single_velocity_multi_sources()` 透传 `freq` |
+
+**向后兼容**: freq 文件不存在时自动 fallback 到 `default_freq`，行为与改动前完全一致。
+
+---
+
+**最后更新**: 2026-04-09
 **维护者**: Zhang Daoguang

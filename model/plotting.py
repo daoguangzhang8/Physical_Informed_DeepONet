@@ -14,7 +14,7 @@ def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
 
     nx = actual_nx
     nz = actual_nz
-    spatial_step = 40.
+    spatial_step = float(args.dh)
     device = args.device
 
     # 根据边界类型计算裁切后的有效网格数（物理区域）
@@ -78,8 +78,8 @@ def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
     U_test_imag = U_test[1, z_slice_label, x_slice_label]
 
     # 计算物理区域的实际距离范围（基于原始物理区域 70×70，空间步长 40m）
-    physical_size_z = 70 * 40  # 2800m
-    physical_size_x = 70 * 40  # 2800m
+    physical_size_z = 70 * args.dh
+    physical_size_x = 70 * args.dh
 
     # 为参考数据（裁切后的标签）生成横坐标
     x_test = np.linspace(0, physical_size_x, num=U_test_real.shape[1], endpoint=True)
@@ -156,9 +156,9 @@ def plot_loss(epoch, save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_lo
 
 
 
-def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_fine_tune, loc=2):
+def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_fine_tune, loc=2, freq=None):
     if if_fine_tune:
-        model = fine_tuning(args, model, fno, dataloader_y, vel, UU0, labels)
+        model = fine_tuning(args, model, fno, dataloader_y, vel, UU0, labels, freq=freq)
     model.eval()
     device = args.device
     # 使用 pml_active 作为画图时的裁切力度（训练数据保留了 pml_active 个 PML 网格）
@@ -275,7 +275,7 @@ def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_
     plt.savefig(args.save_doc + '/error_' + f'{filename}.png')
     plt.close()
     
-def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
+def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels, freq=None):
     device = args.device
     model_ft = copy.deepcopy(model0).to(device)
     NIter = args.ft_NIter
@@ -315,15 +315,17 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
         labels_fno = fno(vel.to(device), UU0.to(device)).to(device)
     optimizer.zero_grad()
     for i in range(NIter):
+
         batch_loss = []
         for batch in dataloader_y:
             y_batch = batch[0].to(device)
             y_batch = y_batch.unsqueeze(0).expand(vel.shape[0], -1, -1)
             
             # 计算损失
+            freq_dev = freq.to(device) if freq is not None else None
             loss, loss_f, loss_u, loss_r = model_ft.loss(
-                vel.to(device), y_batch, UU0.to(device), labels.to(device), 
-                a, b, c, data_norm_coe, pde_norm_coe
+                vel.to(device), y_batch, UU0.to(device), labels.to(device),
+                a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_dev
             )
             loss_op = c * model_ft.loss_op(model0, vel.to(device), y_batch, UU0.to(device))
             loss = loss + loss_op
@@ -337,7 +339,8 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
             # if (i + 1) % args.accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad() # 更新完后清空梯度
-                
+            scheduler.step(loss) # 传入当前损失以调整学习率
+
             batch_loss.append(loss.item())
             loss_u_log.append(loss_u.item())
             loss_f_log.append(loss_f.item())
@@ -359,7 +362,7 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels):
             best_model_state = copy.deepcopy(model_ft.state_dict())
             print(f"微调 {i}/{NIter} --> 发现最佳模型! 当前总损失: {best_loss:.6f}")
 
-        print(f"微调 {i}/{NIter}, PDE损失: {np.mean(loss_f_log)/(args.batch_size * args.batch_size_v * 2):.6f}, 数据损失: {np.mean(loss_u_log)/(args.batch_size * args.batch_size_v * 2):.6f}, 锚定损失:{np.mean(loss_op_batch)/(args.batch_size * args.batch_size_v * 2):.6f}")
+        print(f"微调 {i}/{NIter}, PDE损失: {np.mean(loss_f_log):.6f}, 数据损失: {np.mean(loss_u_log):.6f}, 锚定损失:{np.mean(loss_op_batch):.6f}")
         
         loss_f_log = []
         loss_u_log = []

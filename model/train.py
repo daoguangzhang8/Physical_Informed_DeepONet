@@ -89,7 +89,14 @@ def train(args):
             batch_loss, batch_u_loss, batch_f_loss, batch_r_loss = [], [], [], []
             
             # 遍历训练数据
-            for vel_batch, UU0_batch, labels_batch in dataloader['train']:
+            has_freq = len(dataloader['train'].dataset.tensors) >= 4
+            for batch_data in dataloader['train']:
+                if has_freq:
+                    vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
+                    freq_batch = freq_batch.to(device)
+                else:
+                    vel_batch, UU0_batch, labels_batch = batch_data
+                    freq_batch = None
                 vel_batch, UU0_batch = vel_batch.to(device), UU0_batch.to(device)
 
                 # 根据配置选择标签来源
@@ -98,34 +105,34 @@ def train(args):
                         labels_batch = fno(vel_batch, UU0_batch).to(device)
                 else:
                     labels_batch = labels_batch.to(device)
-                
+
                 # 针对每个空间坐标点集计算损失
                 for batch in dataloader['train_y']:
                     y_batch = batch[0].to(device)
                     y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
-                    
+
                     # 前向传播与计算损失
                     loss, loss_f, loss_u, loss_r = model.loss(
-                        vel_batch, y_batch, UU0_batch, labels_batch, 
-                        a, b, c, data_norm_coe, pde_norm_coe
+                        vel_batch, y_batch, UU0_batch, labels_batch,
+                        a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch
                     )
-                    
+
                     # 梯度累加与反向传播
                     loss = loss / args.accumulation_steps
                     loss.backward()
-                    
+
                     # 修复：使用 step_counter 而不是 epoch i 来判断是否更新梯度
-                    step_counter += 1  
+                    step_counter += 1
                     if step_counter % args.accumulation_steps == 0:
                         optimizer.step()
-                        optimizer.zero_grad() 
-                        
+                        optimizer.zero_grad()
+
                     # 记录真实损失值
-                    batch_loss.append(loss.item() * args.accumulation_steps) 
+                    batch_loss.append(loss.item() * args.accumulation_steps)
                     batch_u_loss.append(loss_u.item())
                     batch_f_loss.append(loss_f.item())
                     batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
-                    
+
                     # 新增：手动切断引用，立即释放该 sub-batch 的巨大计算图，极大降低显存占用
                     del loss, loss_f, loss_u, loss_r, y_batch
 
@@ -172,18 +179,24 @@ def train(args):
                 batch_u_loss, batch_f_loss = [], [] 
                 
                  
-                for vel_batch, UU0_batch, labels_batch in dataloader['valid']:
+                for batch_data in dataloader['valid']:
+                    if has_freq:
+                        vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
+                        freq_batch = freq_batch.to(device)
+                    else:
+                        vel_batch, UU0_batch, labels_batch = batch_data
+                        freq_batch = None
                     vel_batch = vel_batch.to(device)
                     UU0_batch = UU0_batch.to(device)
                     labels_batch = labels_batch.to(device)
-                    
+
                     for batch in dataloader['valid_y']:
                         y_batch = batch[0].to(device)
                         y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
-                        
+
                         _, loss_f_valid, loss_u_valid, _ = model.loss(
-                            vel_batch, y_batch, UU0_batch, labels_batch, 
-                            a, b, c, data_norm_coe, pde_norm_coe
+                            vel_batch, y_batch, UU0_batch, labels_batch,
+                            a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch
                         )
                         batch_u_loss.append(loss_u_valid.item())
                         batch_f_loss.append(loss_f_valid.item())
@@ -197,18 +210,21 @@ def train(args):
             if i % args.save_fig_every == 0:
                 vel_pred, UU0_pred, labels_pred = plot_data["vel_pred"], plot_data["UU0_pred"], plot_data["labels_pred"]
                 vel_test, UU0_test, labels_test = plot_data["vel_test"], plot_data["UU0_test"], plot_data["labels_test"]
+                has_freq = plot_data.get("has_freq", False)
+                freq_pred = plot_data["freq_valid"][0:1] if has_freq else None
+                freq_test = plot_data["freq_train"][0:1] if has_freq else None
 
                 marmousi_data = ext_val_sets['Marmousi']
                 v_m_test, u0_m_test, lab_m_test = marmousi_data["plot_data"]["v_test"], marmousi_data["plot_data"]["u0_test"], marmousi_data["plot_data"]["lab_test"]
                 dataloader_m_y_full = marmousi_data["loader"]
 
                 plot_loss(i, args.save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss)
-                
+
                 if i % (args.save_fig_every * 20) == 0 and i > 0 and args.if_finetune:
                     test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'FT_Marmousi', if_fine_tune=True)
-                    
-                test_plot(args, model, fno, i, dataloader["pred"], vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False)
-                test_plot(args, model, fno, i, dataloader["test"], vel_test, UU0_test, labels_test, 'train', if_fine_tune=False)
+
+                test_plot(args, model, fno, i, dataloader["pred"], vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False, freq=freq_pred)
+                test_plot(args, model, fno, i, dataloader["test"], vel_test, UU0_test, labels_test, 'train', if_fine_tune=False, freq=freq_test)
                 # test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'Marmousi', if_fine_tune=False)
                 plot_sinlge(model, args, 6, vel_test, UU0_test, labels_test)
 

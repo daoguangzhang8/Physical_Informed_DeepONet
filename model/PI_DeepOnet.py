@@ -39,8 +39,8 @@ class Pi_DeepONet(nn.Module):
         # --- 注意力与特征融合 ---
         self.channel_attention1 = ChannelAttention(self.feat_dim, reduction=8)
         self.channel_attention2 = ChannelAttention(self.feat_dim, reduction=8)
-        self.combinedlayer1 = GaussianWeightedLayer(self.feat_dim)
-        self.combinedlayer2 = GaussianWeightedLayer(self.feat_dim)
+        self.combinedlayer1 = GaussianWeightedLayer(self.feat_dim, dh=args.dh)
+        self.combinedlayer2 = GaussianWeightedLayer(self.feat_dim, dh=args.dh)
         self.attengate = AttenGate(use_softmax=True)
         
         self.block_feature_encoder = BlockFeatureEncoder(self.feat_dim, self.feat_dim, grid_size=20)
@@ -95,7 +95,7 @@ class Pi_DeepONet(nn.Module):
         x_dim = vel.shape[-1]
         
         # --- 1. 坐标预处理与 Trunk 特征提取 (Query) ---
-        y_normalized = 2 * (y - 0) / (40 * x_dim - 0) - 1
+        y_normalized = 2 * (y - 0) / (self.args.dh * x_dim - 0) - 1
         z_normalized = y_normalized[:, :, 0].unsqueeze(-1)
         x_normalized = y_normalized[:, :, 1].unsqueeze(-1)
         
@@ -138,9 +138,12 @@ class Pi_DeepONet(nn.Module):
         dynamic_coeff = lambda_aux * (x ** 2)
         return dynamic_coeff * error
         
-    def loss_PDE_Scatter_pml(self, vel, y, UU0):
+    def loss_PDE_Scatter_pml(self, vel, y, UU0, freq_batch=None):
         """
         计算包含 PML 吸收边界条件的散射场 Helmholtz 方程物理残差损失。
+
+        Args:
+            freq_batch: 每个样本对应的频率值 [B_v]。若为 None 则使用默认值 5 Hz。
         """
         y.requires_grad_(True)
 
@@ -150,7 +153,7 @@ class Pi_DeepONet(nn.Module):
 
         Z_dim = vel.shape[2]
         X_dim = vel.shape[3]
-        SPATIAL_SCALE = 40.0
+        SPATIAL_SCALE = float(self.args.dh)
 
         # --- 1. 坐标归一化与 Grid 构造 ---
         z_pixel = y_sample[:, :, 0] / SPATIAL_SCALE
@@ -172,7 +175,12 @@ class Pi_DeepONet(nn.Module):
 
         # --- 3. 物理常数与衰减因子准备 ---
         c0 = torch.ones_like(c) * 1.5
-        f, f0 = 5, 10
+        f0 = 10
+        if freq_batch is not None:
+            # freq_batch: [B_v] → 扩展到 [B_v, B_pts]
+            f = freq_batch.unsqueeze(1).expand(batch_size_v, batch_size_pts)
+        else:
+            f = float(self.args.default_freq)
         omega = 2 * np.pi * f * 1e-3
         k = (1 / c) ** 2
         k0 = (1 / c0) ** 2
@@ -200,18 +208,19 @@ class Pi_DeepONet(nn.Module):
 
         # PML 边界系数 (detach: 只依赖坐标位置，不需要对网络参数求导)
         with torch.no_grad():
+            dh = self.args.dh
             # x 方向（水平）: 左右都有 PML（对称）
-            lx = F.relu(((ld - 0.5) * 40 - xx) / ((ld - 0.5) * 40)) + \
-                 F.relu((xx - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
+            lx = F.relu(((ld - 0.5) * dh - xx) / ((ld - 0.5) * dh)) + \
+                 F.relu((xx - (69.5 + ld) * dh) / ((ld - 0.5) * dh))
 
             # z 方向（垂直）: 根据 boundary_type 决定
             if self.args.boundary_type == 'free_surface':
                 # 自由表面边界：顶部无 PML，只在底部激活
-                lz = F.relu((zz - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
+                lz = F.relu((zz - (69.5 + ld) * dh) / ((ld - 0.5) * dh))
             else:  # 'full_pml'
                 # 完全 PML 边界：上下都激活
-                lz = F.relu(((ld - 0.5) * 40 - zz) / ((ld - 0.5) * 40)) + \
-                     F.relu((zz - (69.5 + ld) * 40) / ((ld - 0.5) * 40))
+                lz = F.relu(((ld - 0.5) * dh - zz) / ((ld - 0.5) * dh)) + \
+                     F.relu((zz - (69.5 + ld) * dh) / ((ld - 0.5) * dh))
 
             pml_tmp1 = C ** 2 * lx ** 2 * lz ** 2
             pml_tmp2 = C ** 2 * lx ** 4
@@ -296,7 +305,7 @@ class Pi_DeepONet(nn.Module):
         # 修复：使用实际网格尺寸而不是硬编码 72
         Z_dim = vel.shape[2]
         X_dim = vel.shape[3]
-        y_norm = 2 * (y - 0) / (40 * X_dim) - 1  # 使用实际x维度
+        y_norm = 2 * (y - 0) / (self.args.dh * X_dim) - 1  # 使用实际x维度
         z_enc = self.pos_encoder(y_norm[:, :, 0:1])
         x_enc = self.pos_encoder(y_norm[:, :, 1:2])
 
@@ -322,9 +331,9 @@ class Pi_DeepONet(nn.Module):
         """
         # 修复：如果未提供max_z和max_x，使用vel的实际尺寸
         if max_z is None:
-            max_z = float(vel.shape[2]) * 40.0  # 转换为实际坐标
+            max_z = float(vel.shape[2]) * self.args.dh  # 转换为实际坐标
         if max_x is None:
-            max_x = float(vel.shape[3]) * 40.0
+            max_x = float(vel.shape[3]) * self.args.dh
 
         B_v = vel.shape[0]
         device = vel.device
@@ -394,21 +403,24 @@ class Pi_DeepONet(nn.Module):
         return torch.mean(loss_env)
 
         
-    def loss(self, vel, y, UU0, labels, a, b, c, data_norm_coe=1., pde_norm_coe=1.):
+    def loss(self, vel, y, UU0, labels, a, b, c, data_norm_coe=1., pde_norm_coe=1., freq_batch=None):
         """
         核心损失函数计算接口
+
+        Args:
+            freq_batch: 每个样本对应的频率值 [B_v]。若为 None 则使用默认值。
         """
         batch_size_v = vel.shape[0]
         nz, nx = vel.shape[2], vel.shape[3]
-        
+
         # 1. 提取标签坐标 (根据给定的 y)
         batch_idx = torch.arange(batch_size_v, device=labels.device)[:, None]
-        z_coord = (y[:, :, 0] / 40.0).long().clamp(0, nz - 1)
-        x_coord = (y[:, :, 1] / 40.0).long().clamp(0, nx - 1)
+        z_coord = (y[:, :, 0] / self.args.dh).long().clamp(0, nz - 1)
+        x_coord = (y[:, :, 1] / self.args.dh).long().clamp(0, nx - 1)
         # 修复：转置以匹配 pred 的维度顺序 [B_v, B_pts, 2]
         # print('labels', labels.shape)
-        labels = labels[batch_idx, :, z_coord, x_coord]  # [B_v, 2, B_pts] -> [B_v, B_pts, 2] 
-        
+        labels = labels[batch_idx, :, z_coord, x_coord]  # [B_v, 2, B_pts] -> [B_v, B_pts, 2]
+
         # 2. 生成自适应物理采样点并与原始采样点合并 (减少一次 PDE 计算)
         y_ran = self.generate_structure_aware_y_ran(vel, num_pts=900, max_z=nz, max_x=nx)
 
@@ -417,7 +429,7 @@ class Pi_DeepONet(nn.Module):
 
         # 3. 计算各项基础损失 (PDE 只需计算一次)
         loss_u = self.loss_BC(vel, y, UU0, labels) / data_norm_coe
-        loss_f_combined = self.loss_PDE_Scatter_pml(vel, y_combined, UU0) / pde_norm_coe
+        loss_f_combined = self.loss_PDE_Scatter_pml(vel, y_combined, UU0, freq_batch=freq_batch) / pde_norm_coe
 
         loss_r = 0.0  # 占位
 

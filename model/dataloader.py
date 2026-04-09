@@ -3,13 +3,16 @@ from model.utils import Halton_Sample
 
 
 
-def Training_data(args, vel, UU_loc, UU0_loc):
+def Training_data(args, vel, UU_loc, UU0_loc, freq=None):
     """
     生成训练数据和验证数据（支持多震源并发训练）
+
+    Args:
+        freq: 频率数据 [N_vel]，每个速度模型对应一个频率值。若为 None 则使用默认值。
     """
     # 1. 基本参数准备
     nvel, ny, pml_crop = args.nvel_train, args.ny_train, args.pml_crop
-    spatial_step = 40
+    spatial_step = args.dh
     nz, nx = vel.shape[1], vel.shape[2]
     valid_num = int(args.valid_rate * nvel) + 1
     
@@ -28,31 +31,35 @@ def Training_data(args, vel, UU_loc, UU0_loc):
     # --- 核心处理逻辑封装（支持多震源数据拼接） ---
     def process_split(indices, count):
         # 提取当前划分的速度模型基础张量 [count, 1, NZ, NX]
-        base_vel = vel[indices[:count], :, :].unsqueeze(1) 
-        
-        vel_list, u_list, u0_list, labels_list, src_list = [], [], [], [], []
-        
+        base_vel = vel[indices[:count], :, :].unsqueeze(1)
+
+        vel_list, u_list, u0_list, labels_list, src_list, freq_list = [], [], [], [], [], []
+
         # 遍历所有被激活的震源
         for loci in loc_list:
             # 1. 速度模型对每个震源都是一样的，直接复制加入列表
             vel_list.append(base_vel)
-            
+
             # 2. 提取对应震源的物理场数据 [count, 2, NZ, NX]
             u_current = UU_loc[loci][indices[:count], :, :, :]
             u0_current = UU0_loc[loci][indices[:count], :, :, :]
-            
+
             # 3. 计算标签残差
             labels_current = u_current - u0_current
-            
+
             u_list.append(u_current)
             u0_list.append(u0_current)
             labels_list.append(labels_current)
-            
+
             # 4. 计算当前 Source 坐标并扩展维度 (适配当前 batch 大小 count)
             sz, sx = source_coords[loci]
             # 这里将维度扩展为 [count, 2]，代表这 count 个样本对应同一个震源坐标
             src_tensor = torch.tensor([sz, sx]).expand(count, -1).float()
             src_list.append(src_tensor * spatial_step)
+
+            # 5. freq 按震源复制（每个速度模型的 freq 对所有震源相同）
+            if freq is not None:
+                freq_list.append(freq[indices[:count]])
 
         # 沿 Batch 维度 (dim=0) 拼接所有震源的数据
         # 最终的 Batch Size = count * len(loc_list)
@@ -61,27 +68,38 @@ def Training_data(args, vel, UU_loc, UU0_loc):
         u0_out = torch.cat(u0_list, dim=0)
         labels_out = torch.cat(labels_list, dim=0)
         src_out = torch.cat(src_list, dim=0)
-            
-        return vel_out, u_out, u0_out, labels_out, src_out
+        freq_out = torch.cat(freq_list, dim=0) if freq_list else None
+
+        return vel_out, u_out, u0_out, labels_out, src_out, freq_out
 
     # --- 3. 生成训练集数据 ---
-    vel_train, UU_loc_train, UU0_train, labels, source_train = process_split(idx, nvel)
+    vel_train, UU_loc_train, UU0_train, labels, source_train, freq_train = process_split(idx, nvel)
     
-    # 训练集的坐标点 y_train (使用全部网格平铺逻辑，所有样本共享一份即可节省内存)
-    x_c = torch.arange(0, nx)
-    z_c = torch.arange(0, nz)
-    grid_z, grid_x = torch.meshgrid(z_c, x_c, indexing='ij') 
-    y_train = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1).float() * spatial_step
+    # 训练集的坐标点 y_train（所有样本共享一份以节省内存）
+    if getattr(args, 'sampling_mode', 'full_grid') == 'halton':
+        # Halton 准随机采样
+        total_pts = nz * nx
+        ratio = getattr(args, 'halton_sample_ratio', 0.2)
+        num_pts = max(1, int(total_pts * ratio))
+        halton_indices = Halton_Sample((nz, nx), num_pts)
+        z_idx = torch.tensor([p[0] for p in halton_indices], dtype=torch.float32)
+        x_idx = torch.tensor([p[1] for p in halton_indices], dtype=torch.float32)
+        y_train = torch.stack([z_idx, x_idx], dim=1) * spatial_step
+        print(f'[Halton] 采样点数: {num_pts}, y_train shape: {y_train.shape}')
+    else:
+        # 全网格采样（默认）
+        x_c = torch.arange(0, nx)
+        z_c = torch.arange(0, nz)
+        grid_z, grid_x = torch.meshgrid(z_c, x_c, indexing='ij')
+        y_train = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1).float() * spatial_step
 
     # --- 4. 生成验证集数据 ---
-    vel_valid, UU_loc_valid, UU0_valid, labels_valid, source_valid = process_split(remaining_idx, valid_num)
+    vel_valid, UU_loc_valid, UU0_valid, labels_valid, source_valid, freq_valid = process_split(remaining_idx, valid_num)
     y_valid = y_train  # 验证集坐标点与训练集保持一致
-    
-    # 注意：原代码的 return 中没有包含 source_train 和 source_valid。
-    # 如果您的 DeepONet 损失函数（或网络输入）需要动态震源坐标，请考虑在返回值中加入它们！
+
     return (
-        vel_train, UU_loc_train, UU0_train, y_train, labels, 
-        vel_valid, UU_loc_valid, UU0_valid, y_valid, labels_valid
+        vel_train, UU_loc_train, UU0_train, y_train, labels, freq_train,
+        vel_valid, UU_loc_valid, UU0_valid, y_valid, labels_valid, freq_valid
     )
 
 def Test_data_single(args, loc_idx, vel_single, UU_loc_single, UU0_loc_single):
@@ -89,7 +107,7 @@ def Test_data_single(args, loc_idx, vel_single, UU_loc_single, UU0_loc_single):
     专门用于加载测试模型（如 Marmousi），支持自适应单震源或多震源并发输入。
     """
     # 1. 基本参数准备
-    spatial_step = 40
+    spatial_step = args.dh
     nz, nx = vel_single.shape[-2], vel_single.shape[-1]
     
     # 确保输入是 Tensor
@@ -149,6 +167,19 @@ def prepare_training_dataloaders(args, device):
     UU0_original = load_tensor_from_npy(args.load_path, args.backgroundfield_filename)
     UU_original = load_tensor_from_npy(args.load_path, args.wavefield_filename)
 
+    # 加载频率数据（若文件存在）
+    freq_filename = getattr(args, 'freq_filename', None)
+    if freq_filename:
+        freq_path = os.path.join(args.load_path, freq_filename)
+        if os.path.exists(freq_path):
+            freq = torch.tensor(np.load(freq_path), dtype=torch.float32)
+            print(f'已加载频率数据: {freq_filename}, shape: {freq.shape}, 唯一值: {freq.unique().tolist()}')
+        else:
+            print(f'⚠️ 频率文件不存在: {freq_path}，将使用默认频率')
+            freq = None
+    else:
+        freq = None
+
     # 2. PML 边界处理
     if args.pml:
         pml_crop = args.pml_crop
@@ -178,8 +209,8 @@ def prepare_training_dataloaders(args, device):
     UU0_loc = [UU0[loc * len(vel) : (loc + 1) * len(vel), ...] for loc in range(5)]
     
     np.random.seed(1)
-    vel_train, UU_loc_train, UU0_train, y_train, labels_train, \
-    vel_valid, UU_loc_valid, UU0_valid, y_valid, labels_valid = Training_data(args, vel, UU_loc, UU0_loc)
+    vel_train, UU_loc_train, UU0_train, y_train, labels_train, freq_train, \
+    vel_valid, UU_loc_valid, UU0_valid, y_valid, labels_valid, freq_valid = Training_data(args, vel, UU_loc, UU0_loc, freq)
     print('vel_train', vel_train.shape)
     # 4. 物理场归一化
     vel_train = vel_train / 1000.
@@ -188,11 +219,11 @@ def prepare_training_dataloaders(args, device):
     vel_pred, UU0_pred, labels_pred = vel_valid[0:1], UU0_valid[0:1], labels_valid[0:1]
     vel_test, UU0_test, labels_test = vel_train[0:1], UU0_train[0:1], labels_train[0:1]
 
-    # 5. 生成坐标网格点 (dx=dz=40)
+    # 5. 生成坐标网格点
     x_coords, z_coords = torch.arange(0, args.nx), torch.arange(0, args.nz)
     grid_z, grid_x = torch.meshgrid(z_coords, x_coords, indexing='ij')
     points = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1)
-    y_pred = points.float() * 40
+    y_pred = points.float() * args.dh
     y_test = y_pred
 
     # 6. 构建 DataLoader (添加 num_workers 加速数据加载)
@@ -200,14 +231,22 @@ def prepare_training_dataloaders(args, device):
     num_workers = 4
     prefetch_factor = 2
 
+    # 构建 DataLoader 时根据 freq 是否存在决定 TensorDataset 内容
+    train_ds = (TensorDataset(vel_train, UU0_train, labels_train, freq_train)
+                if freq_train is not None
+                else TensorDataset(vel_train, UU0_train, labels_train))
+    valid_ds = (TensorDataset(vel_valid, UU0_valid, labels_valid, freq_valid)
+                if freq_valid is not None
+                else TensorDataset(vel_valid, UU0_valid, labels_valid))
+
     train_loaders = {
-        "train": DataLoader(TensorDataset(vel_train, UU0_train, labels_train),
+        "train": DataLoader(train_ds,
                             batch_size=args.batch_size_v, shuffle=True, drop_last=True,
                             pin_memory=pin_mem, num_workers=num_workers, prefetch_factor=prefetch_factor),
         "train_y": DataLoader(TensorDataset(y_train),
                               batch_size=args.batch_size, shuffle=True, pin_memory=pin_mem,
                               num_workers=num_workers, prefetch_factor=prefetch_factor),
-        "valid": DataLoader(TensorDataset(vel_valid, UU0_valid, labels_valid),
+        "valid": DataLoader(valid_ds,
                             batch_size=args.valid_batch_size_v, shuffle=True, drop_last=True,
                             pin_memory=pin_mem, num_workers=num_workers, prefetch_factor=prefetch_factor),
         "valid_y": DataLoader(TensorDataset(y_valid),
@@ -220,7 +259,9 @@ def prepare_training_dataloaders(args, device):
     plot_data = {
         "vel_pred": vel_pred, "UU0_pred": UU0_pred, "labels_pred": labels_pred,
         "vel_test": vel_test, "UU0_test": UU0_test, "labels_test": labels_test,
-        "y_pred": y_pred  # 供外部验证集复用坐标
+        "y_pred": y_pred,  # 供外部验证集复用坐标
+        "freq_train": freq_train, "freq_valid": freq_valid,
+        "has_freq": freq_train is not None,
     }
     
     return train_loaders, plot_data

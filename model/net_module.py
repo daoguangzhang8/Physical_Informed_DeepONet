@@ -111,8 +111,9 @@ class PositionalEembedding(nn.Module):
         return x
 
 class GaussianWeightedLayer(nn.Module):
-    def __init__(self, feat_dim):
+    def __init__(self, feat_dim, dh=40):
         super().__init__()
+        self.dh = dh
         self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.compress= nn.Sequential(
             nn.Linear((feat_dim + 0) * 16, feat_dim * 8),
@@ -139,10 +140,8 @@ class GaussianWeightedLayer(nn.Module):
         # global_avg = global_avg.squeeze(-1).squeeze(-1)  # (b1, feat_dim) → 直接挤压，无需中间unsqueeze
         # -------------------------- 2. 向量化坐标映射（避免循环，直接计算索引）--------------------------
         # 假设centers是归一化坐标（如[-1,1]），映射到特征图尺寸[0, H-1]和[0, W-1]
-        # 若原代码的"除以40"是特定映射，可替换为实际坐标转换逻辑（此处保留原意并优化）
-        z_indices = (centers[..., 0] / 40).long().clamp(0, H - 1).detach()
-        x_indices = (centers[..., 1] / 40).long().clamp(0, W - 1).detach()
-        
+        z_indices = (centers[..., 0] / self.dh).long().clamp(0, H - 1).detach()
+        x_indices = (centers[..., 1] / self.dh).long().clamp(0, W - 1).detach()
         # 2. 构造 Batch 索引
         # shape: (b1, 1)
         b1_idx = torch.arange(b1, device=speed_maps.device).view(-1, 1)

@@ -60,6 +60,7 @@ class Args_test:
         vel_filename = 'freesurface_velocity_freq5_1source_80_90_n1.npy'
         backgroundfield_filename = 'freesurface_backgroundfield_freq5_1source_80_90_n1.npy'
         wavefield_filename = 'freesurface_wavefield_freq5_1sources_80_90_n1.npy'
+        freq_filename = 'freesurface_freq_data_80_90_n1.npy'
     else:  # 'full_pml'
         # full_pml 版本：使用原始文件名
         vel_filename = 'velocity_data_70_70_n1.npy'
@@ -129,9 +130,9 @@ class Args_test:
     if_finetune = True
     ft_NIter = 1000
     ft_lr = 2e-5
-    ft_a = 0.2
+    ft_a = 0.
     ft_b = 1
-    ft_c = 0.1                                  
+    ft_c = 0.00001                                  
     
     # ==========================================
     # 8. 主训练循环超参数
@@ -163,7 +164,7 @@ def Test_data_single(args, loc_idx, vel_single, UU_loc_single, UU0_loc_single):
     专门用于加载测试模型（如 Marmousi），支持自适应单震源或多震源并发输入。
     """
     # 1. 基本参数准备
-    spatial_step = 40
+    spatial_step = args.dh
     nz, nx = vel_single.shape[-2], vel_single.shape[-1]
 
     # 确保输入是 Tensor
@@ -313,7 +314,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 
-def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, epoch, save_doc, filename_prefix="MultiSource", if_fine_tune=False, fno=None):
+def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, epoch, save_doc, filename_prefix="MultiSource", if_fine_tune=False, fno=None, freq=None):
     """
     带有自适应微调机制的多震源波场预测对比图绘制。
     直接调用外部的 fine_tuning 函数，不对其做任何修改。
@@ -326,7 +327,7 @@ def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, 
     x_coords, z_coords = torch.arange(0, grid_nx), torch.arange(0, grid_nz)
     grid_z, grid_x = torch.meshgrid(z_coords, x_coords, indexing='ij')
     points = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1)
-    y_full_grid = points.float() * 40  
+    y_full_grid = points.float() * args.dh
     
     dataset_y = TensorDataset(y_full_grid)
     dataloader_y = DataLoader(dataset_y, batch_size=args.batch_size, shuffle=False)
@@ -343,7 +344,11 @@ def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, 
         vel_ft = vel.expand(UU0_ft.shape[0], -1, -1, -1).to(device)
         
         # 直接调用你的微调函数
-        eval_model = fine_tuning(args, model, fno, dataloader_y, vel_ft, UU0_ft, labels_ft)
+        # freq 扩展以匹配震源数量
+        freq_ft = None
+        if freq is not None:
+            freq_ft = freq.expand(UU0_ft.shape[0]).to(device)
+        eval_model = fine_tuning(args, model, fno, dataloader_y, vel_ft, UU0_ft, labels_ft, freq=freq_ft)
         
         # 在文件名后缀追加 _FT (Fine-Tuned)
         filename_prefix = f"{filename_prefix}_FT"
