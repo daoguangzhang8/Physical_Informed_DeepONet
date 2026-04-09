@@ -18,5 +18,10 @@ __pycache__/
 runs/
 logs/
 .ipynb_checkpoints/
-nohup.out
+nohup*.out
 *.pyc
+
+# Training Outputs (训练输出目录)
+output/
+output*/
+res.png
