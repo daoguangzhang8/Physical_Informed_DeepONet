@@ -107,6 +107,10 @@ def train(args):
                     labels_batch = labels_batch.to(device)
 
                 # 针对每个空间坐标点集计算损失
+                # 每个 velocity batch 只生成一次自适应采样点
+                with torch.no_grad():
+                    y_ran = model.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+
                 for batch in dataloader['train_y']:
                     y_batch = batch[0].to(device)
                     y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
@@ -114,7 +118,8 @@ def train(args):
                     # 前向传播与计算损失
                     loss, loss_f, loss_u, loss_r = model.loss(
                         vel_batch, y_batch, UU0_batch, labels_batch,
-                        a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch
+                        a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch,
+                        y_ran=y_ran
                     )
 
                     # 梯度累加与反向传播
@@ -214,14 +219,14 @@ def train(args):
                 freq_pred = plot_data["freq_valid"][0:1] if has_freq else None
                 freq_test = plot_data["freq_train"][0:1] if has_freq else None
 
-                marmousi_data = ext_val_sets['Marmousi']
-                v_m_test, u0_m_test, lab_m_test = marmousi_data["plot_data"]["v_test"], marmousi_data["plot_data"]["u0_test"], marmousi_data["plot_data"]["lab_test"]
-                dataloader_m_y_full = marmousi_data["loader"]
+                # marmousi_data = ext_val_sets['Marmousi']
+                # v_m_test, u0_m_test, lab_m_test = marmousi_data["plot_data"]["v_test"], marmousi_data["plot_data"]["u0_test"], marmousi_data["plot_data"]["lab_test"]
+                # dataloader_m_y_full = marmousi_data["loader"]
 
                 plot_loss(i, args.save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss)
 
-                if i % (args.save_fig_every * 20) == 0 and i > 0 and args.if_finetune:
-                    test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'FT_Marmousi', if_fine_tune=True)
+                # if i % (args.save_fig_every * 20) == 0 and i > 0 and args.if_finetune:
+                #     test_plot(args, model, fno, i, dataloader_m_y_full, v_m_test, u0_m_test, lab_m_test, 'FT_Marmousi', if_fine_tune=True)
 
                 test_plot(args, model, fno, i, dataloader["pred"], vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False, freq=freq_pred)
                 test_plot(args, model, fno, i, dataloader["test"], vel_test, UU0_test, labels_test, 'train', if_fine_tune=False, freq=freq_test)

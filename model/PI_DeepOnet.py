@@ -141,12 +141,27 @@ class Pi_DeepONet(nn.Module):
     def loss_PDE_Scatter_pml(self, vel, y, UU0, freq_batch=None):
         """
         计算包含 PML 吸收边界条件的散射场 Helmholtz 方程物理残差损失。
+        （向后兼容接口，内部调用 _compute_pde_residual）
 
         Args:
             freq_batch: 每个样本对应的频率值 [B_v]。若为 None 则使用默认值 5 Hz。
         """
         y.requires_grad_(True)
+        Delta_U = self.forward(vel, y, UU0)
+        return self._compute_pde_residual(vel, y, UU0, Delta_U, freq_batch=freq_batch)
 
+    def _compute_pde_residual(self, vel, y, UU0, Delta_U, freq_batch=None):
+        """
+        计算包含 PML 吸收边界条件的散射场 Helmholtz 方程物理残差。
+        接受已计算好的 Delta_U（forward 输出），避免重复前向传播。
+
+        Args:
+            vel: 速度场 [B_v, 1, Z, X]
+            y: 坐标点 [B_v, N, 2]，需要 requires_grad=True
+            UU0: 背景波场 [B_v, 2, Z, X]
+            Delta_U: forward 输出 [B_v, N, 2]
+            freq_batch: 每个样本对应的频率值 [B_v]
+        """
         batch_size_v = vel.shape[0]
         batch_size_pts = y.shape[1]
         y_sample = y.expand(batch_size_v, -1, -1)
@@ -164,11 +179,9 @@ class Pi_DeepONet(nn.Module):
         grid = torch.stack([x_norm, z_norm], dim=-1).unsqueeze(1)  # [B_v, 1, B_pts, 2]
 
         # --- 2. 可微双线性插值采样 ---
-        # 采样速度场 c (detach: 速度场是输入数据，不需要梯度)
         c_sampled = F.grid_sample(vel[:, :1, :, :], grid, mode='bilinear', padding_mode='border', align_corners=True)
         c = c_sampled.view(batch_size_v, batch_size_pts).detach()
 
-        # 采样背景场 U0 (detach: 背景场是输入数据，不需要梯度)
         U0_sampled = F.grid_sample(UU0, grid, mode='bilinear', padding_mode='border', align_corners=True).squeeze(2)
         U0_real = U0_sampled[:, 0, :].detach()
         U0_imag = U0_sampled[:, 1, :].detach()
@@ -177,76 +190,70 @@ class Pi_DeepONet(nn.Module):
         c0 = torch.ones_like(c) * 1.5
         f0 = 10
         if freq_batch is not None:
-            # freq_batch: [B_v] → 扩展到 [B_v, B_pts]
             f = freq_batch.unsqueeze(1).expand(batch_size_v, batch_size_pts)
         else:
             f = float(self.args.default_freq)
-        omega = 2 * np.pi * f * 1e-3
+        omega = 2 * torch.pi * f * 1e-3
         k = (1 / c) ** 2
         k0 = (1 / c0) ** 2
 
         Q = 15
         alpha = 1 / Q
-        rhot = (1 - alpha / np.pi * np.log(f / 50) - 1j * alpha / 2) ** 2
+        rhot = (1 - alpha / torch.pi * torch.log(f / 50) - 1j * alpha / 2) ** 2
 
-        kr, ki = k * np.real(rhot), k * np.imag(rhot)
-        k0r, k0i = k0 * np.real(rhot), k0 * np.imag(rhot)
+        kr, ki = k * torch.real(rhot), k * torch.imag(rhot)
+        k0r, k0i = k0 * torch.real(rhot), k0 * torch.imag(rhot)
 
         a0 = 1.79
         C = a0 * f0 / f
 
         # --- 4. 一阶与二阶导数计算 (Autograd) ---
-        Delta_U = self.forward(vel, y, UU0)
         Delta_U_real, Delta_U_imag = Delta_U[:, :, 0], Delta_U[:, :, 1]
 
         zz, xx = y[:, :, 0], y[:, :, 1]
 
-        # 修复：使用 pml_active 而不是硬编码计算
-        # 物理区域始终是 70×70（由config.py中的nx, nz定义）
-        # ld 是保留的 PML 网格数（参与训练的PML厚度）
-        ld = self.args.pml_active  # 修复点：从 (Z_dim - 70)/2 改为 pml_active
+        ld = self.args.pml_active
 
-        # PML 边界系数 (detach: 只依赖坐标位置，不需要对网络参数求导)
         with torch.no_grad():
             dh = self.args.dh
-            # x 方向（水平）: 左右都有 PML（对称）
-            lx = F.relu(((ld - 0.5) * dh - xx) / ((ld - 0.5) * dh)) + \
-                 F.relu((xx - (69.5 + ld) * dh) / ((ld - 0.5) * dh))
+            # 物理区域边界: nx/nz - 0.5 + pml_active
+            x_boundary = (X_dim - 2 * ld - 0.5 + ld)  # (nx - 0.5 + ld)
+            z_boundary = (Z_dim - ld - 0.5 + ld) if self.args.boundary_type == 'free_surface' else (Z_dim - 2 * ld - 0.5 + ld)
 
-            # z 方向（垂直）: 根据 boundary_type 决定
+            lx = F.relu(((ld - 0.5) * dh - xx) / ((ld - 0.5) * dh)) + \
+                 F.relu((xx - x_boundary * dh) / ((ld - 0.5) * dh))
+
             if self.args.boundary_type == 'free_surface':
-                # 自由表面边界：顶部无 PML，只在底部激活
-                lz = F.relu((zz - (69.5 + ld) * dh) / ((ld - 0.5) * dh))
-            else:  # 'full_pml'
-                # 完全 PML 边界：上下都激活
+                lz = F.relu((zz - z_boundary * dh) / ((ld - 0.5) * dh))
+            else:
                 lz = F.relu(((ld - 0.5) * dh - zz) / ((ld - 0.5) * dh)) + \
-                     F.relu((zz - (69.5 + ld) * dh) / ((ld - 0.5) * dh))
+                     F.relu((zz - z_boundary * dh) / ((ld - 0.5) * dh))
 
             pml_tmp1 = C ** 2 * lx ** 2 * lz ** 2
             pml_tmp2 = C ** 2 * lx ** 4
             pml_tmp3 = C ** 2 * lz ** 4
             pml_tmp4 = C * (lz ** 2 - lx ** 2)
             pml_tmp5 = C * (lx ** 2 + lz ** 2)
-        
+
         # 计算一阶导数
         Delta_U_grad_real = torch.autograd.grad(Delta_U_real, y, grad_outputs=torch.ones_like(Delta_U_real), create_graph=True, retain_graph=True, only_inputs=True)[0]
         Delta_U_grad_imag = torch.autograd.grad(Delta_U_imag, y, grad_outputs=torch.ones_like(Delta_U_imag), create_graph=True, retain_graph=True, only_inputs=True)[0]
-        
+
         Delta_Uz_real, Delta_Ux_real = Delta_U_grad_real[:, :, 0], Delta_U_grad_real[:, :, 1]
         Delta_Uz_imag, Delta_Ux_imag = Delta_U_grad_imag[:, :, 0], Delta_U_grad_imag[:, :, 1]
-        
+
         # 修正的一阶导数 (带 PML)
         eu_zr = (1 + pml_tmp1) / (1 + pml_tmp3) * Delta_Uz_real - pml_tmp4 / (1 + pml_tmp3) * Delta_Uz_imag
         eu_xr = (1 + pml_tmp1) / (1 + pml_tmp2) * Delta_Ux_real + pml_tmp4 / (1 + pml_tmp2) * Delta_Ux_imag
         eu_zi = pml_tmp4 / (1 + pml_tmp3) * Delta_Uz_real + (1 + pml_tmp1) / (1 + pml_tmp3) * Delta_Uz_imag
         eu_xi = -pml_tmp4 / (1 + pml_tmp2) * Delta_Ux_real + (1 + pml_tmp1) / (1 + pml_tmp2) * Delta_Ux_imag
-        
+
         # 计算二阶导数
         Delta_Uzz_real = torch.autograd.grad(eu_zr, y, grad_outputs=torch.ones_like(eu_zr), create_graph=True, retain_graph=True, only_inputs=True)[0][:, :, 0]
         Delta_Uxx_real = torch.autograd.grad(eu_xr, y, grad_outputs=torch.ones_like(eu_xr), create_graph=True, retain_graph=True, only_inputs=True)[0][:, :, 1]
         Delta_Uzz_imag = torch.autograd.grad(eu_zi, y, grad_outputs=torch.ones_like(eu_zi), create_graph=True, retain_graph=True, only_inputs=True)[0][:, :, 0]
         Delta_Uxx_imag = torch.autograd.grad(eu_xi, y, grad_outputs=torch.ones_like(eu_xi), create_graph=True, retain_graph=True, only_inputs=True)[0][:, :, 1]
-        
+
         # --- 5. 组合 PDE 残差 ---
         ur_r = (1 - pml_tmp1) * omega ** 2 * (kr * (Delta_U_real + U0_real) - ki * (Delta_U_imag + U0_imag))
         ui_r = pml_tmp5 * omega ** 2 * (kr * (Delta_U_imag + U0_imag) + ki * (Delta_U_real + U0_real))
@@ -403,12 +410,14 @@ class Pi_DeepONet(nn.Module):
         return torch.mean(loss_env)
 
         
-    def loss(self, vel, y, UU0, labels, a, b, c, data_norm_coe=1., pde_norm_coe=1., freq_batch=None):
+    def loss(self, vel, y, UU0, labels, a, b, c, data_norm_coe=1., pde_norm_coe=1., freq_batch=None, y_ran=None):
         """
-        核心损失函数计算接口
+        核心损失函数计算接口。
+        优化：只做一次 forward pass，同时服务于 BC loss 和 PDE loss。
 
         Args:
             freq_batch: 每个样本对应的频率值 [B_v]。若为 None 则使用默认值。
+            y_ran: 预计算的自适应采样点 [B_v, N_ran, 2]。若为 None 则内部生成。
         """
         batch_size_v = vel.shape[0]
         nz, nx = vel.shape[2], vel.shape[3]
@@ -417,23 +426,29 @@ class Pi_DeepONet(nn.Module):
         batch_idx = torch.arange(batch_size_v, device=labels.device)[:, None]
         z_coord = (y[:, :, 0] / self.args.dh).long().clamp(0, nz - 1)
         x_coord = (y[:, :, 1] / self.args.dh).long().clamp(0, nx - 1)
-        # 修复：转置以匹配 pred 的维度顺序 [B_v, B_pts, 2]
-        # print('labels', labels.shape)
         labels = labels[batch_idx, :, z_coord, x_coord]  # [B_v, 2, B_pts] -> [B_v, B_pts, 2]
 
-        # 2. 生成自适应物理采样点并与原始采样点合并 (减少一次 PDE 计算)
-        y_ran = self.generate_structure_aware_y_ran(vel, num_pts=900, max_z=nz, max_x=nx)
+        # 2. 生成自适应物理采样点 (若未提供则重新生成)
+        if y_ran is None:
+            y_ran = self.generate_structure_aware_y_ran(vel, num_pts=900, max_z=nz, max_x=nx)
 
-        # 合并 y 和 y_ran， batch_size_v = y.shape[0]
         y_combined = torch.cat([y, y_ran], dim=1)  # [B_v, B_pts + B_ran_pts, 2]
+        y_combined.requires_grad_(True)
+        n_y = y.shape[1]
 
-        # 3. 计算各项基础损失 (PDE 只需计算一次)
-        loss_u = self.loss_BC(vel, y, UU0, labels) / data_norm_coe
-        loss_f_combined = self.loss_PDE_Scatter_pml(vel, y_combined, UU0, freq_batch=freq_batch) / pde_norm_coe
+        # 3. 只做一次 forward pass (服务于 BC loss 和 PDE loss)
+        Delta_U = self.forward(vel, y_combined, UU0)
+
+        # 4. BC loss: 使用前 n_y 个点的预测
+        pred_y = Delta_U[:, :n_y, :]
+        loss_u = self.loss_function(pred_y, labels) / data_norm_coe
+
+        # 5. PDE loss: 使用完整输出计算物理残差
+        loss_f_combined = self._compute_pde_residual(vel, y_combined, UU0, Delta_U, freq_batch=freq_batch) / pde_norm_coe
 
         loss_r = 0.0  # 占位
 
-        # 4. 根据权重加权求和
+        # 6. 根据权重加权求和
         loss_val = (a * loss_u) + b * loss_f_combined
 
         return loss_val, loss_f_combined, loss_u, loss_r

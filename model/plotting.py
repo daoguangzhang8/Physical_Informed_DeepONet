@@ -77,9 +77,9 @@ def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
     U_test_real = U_test[0, z_slice_label, x_slice_label]
     U_test_imag = U_test[1, z_slice_label, x_slice_label]
 
-    # 计算物理区域的实际距离范围（基于原始物理区域 70×70，空间步长 40m）
-    physical_size_z = 70 * args.dh
-    physical_size_x = 70 * args.dh
+    # 计算物理区域的实际距离范围（使用实际网格尺寸）
+    physical_size_z = args.nz * args.dh
+    physical_size_x = args.nx * args.dh
 
     # 为参考数据（裁切后的标签）生成横坐标
     x_test = np.linspace(0, physical_size_x, num=U_test_real.shape[1], endpoint=True)

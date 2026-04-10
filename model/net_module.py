@@ -440,10 +440,11 @@ class StandardEncoderLayer(nn.Module):
         return output_ffn
 
 class Tokenizer(nn.Module):
-    def __init__(self, channels, target_size=8):
+    def __init__(self, channels, input_size=70, target_size=8):
         super().__init__()
         # 采用卷积降采样来保留局部信息，而不是简单的插值
-        self.downsample = nn.Conv2d(channels, channels, kernel_size=3, stride=int(70/target_size), padding=1, groups=channels)
+        stride = max(1, int(input_size / target_size))
+        self.downsample = nn.Conv2d(channels, channels, kernel_size=3, stride=stride, padding=1, groups=channels)
         self.conv1x1 = nn.Conv2d(channels, channels, kernel_size=1)
         self.target_size = target_size
 

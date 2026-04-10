@@ -44,6 +44,7 @@ def _train_worker(rank, world_size, args):
     # 初始化分布式环境
     setup_distributed(rank, world_size)
     device = torch.device(f'cuda:{rank}')
+    args.device = rank  # 确保绘图等函数使用正确的 GPU
 
     if is_main_process(rank):
         print("=" * 60)
@@ -82,12 +83,15 @@ def _train_worker(rank, world_size, args):
         dataloader['train'].dataset,
         batch_size=args.batch_size_v,
         sampler=train_sampler,
-        num_workers=4,
+        num_workers=max(1, 4),
         pin_memory=True
     )
 
     if is_main_process(rank):
         print(f"已启用 DistributedSampler (world_size={world_size})")
+
+    # 检测数据集是否包含频率信息
+    has_freq = len(dataloader['train'].dataset.tensors) >= 4
 
     # ==========================================
     # 创建模型
@@ -114,15 +118,15 @@ def _train_worker(rank, world_size, args):
     # ==========================================
     # 优化器与调度器
     # ==========================================
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr * world_size, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=args.factor, patience=args.patience, min_lr=args.min_lr
+        optimizer, mode='min', factor=args.factor, patience=args.patience, min_lr=args.min_lr  * world_size
     )
     warmup_scheduler = WarmupScheduler(
         optimizer=optimizer,
         warmup_epochs=args.warmup_epochs,
-        base_lr=args.lr,
-        warmup_start_lr=args.lr / 10.,
+        base_lr=args.lr * world_size,
+        warmup_start_lr=args.lr  * world_size/ 10.,
         warmup_strategy="linear",
         after_scheduler=None
     )
@@ -165,7 +169,13 @@ def _train_worker(rank, world_size, args):
         dataloader['train'].sampler.set_epoch(i)
 
         # 遍历训练数据
-        for vel_batch, UU0_batch, labels_batch in dataloader['train']:
+        for batch_data in dataloader['train']:
+            if has_freq:
+                vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
+                freq_batch = freq_batch.to(device)
+            else:
+                vel_batch, UU0_batch, labels_batch = batch_data
+                freq_batch = None
             vel_batch, UU0_batch = vel_batch.to(device), UU0_batch.to(device)
 
             if args.use_fno_as_label:
@@ -174,22 +184,31 @@ def _train_worker(rank, world_size, args):
             else:
                 labels_batch = labels_batch.to(device)
 
+            # 每个 velocity batch 只生成一次自适应采样点
+            with torch.no_grad():
+                y_ran = model.module.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+
             for batch in dataloader['train_y']:
                 y_batch = batch[0].to(device)
                 y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
 
-                loss, loss_f, loss_u, loss_r = model.loss(
+                loss, loss_f, loss_u, loss_r = model.module.loss(
                     vel_batch, y_batch, UU0_batch, labels_batch,
-                    a, b, c, data_norm_coe, pde_norm_coe
+                    a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch,
+                    y_ran=y_ran
                 )
 
                 loss = loss / args.accumulation_steps
-                loss.backward()
 
+                # 仅在累加的最后一步同步梯度，中间步跳过以减少通信开销
                 step_counter += 1
                 if step_counter % args.accumulation_steps == 0:
+                    loss.backward()       # 最后一步：同步梯度
                     optimizer.step()
                     optimizer.zero_grad()
+                else:
+                    with model.no_sync():
+                        loss.backward()   # 中间步：跳过同步
 
                 batch_loss.append(loss.item() * args.accumulation_steps)
                 batch_u_loss.append(loss_u.item())
@@ -244,7 +263,13 @@ def _train_worker(rank, world_size, args):
             model.eval()
             batch_u_loss, batch_f_loss = [], []
 
-            for vel_batch, UU0_batch, labels_batch in dataloader['valid']:
+            for batch_data in dataloader['valid']:
+                if has_freq:
+                    vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
+                    freq_batch = freq_batch.to(device)
+                else:
+                    vel_batch, UU0_batch, labels_batch = batch_data
+                    freq_batch = None
                 vel_batch = vel_batch.to(device)
                 UU0_batch = UU0_batch.to(device)
                 labels_batch = labels_batch.to(device)
@@ -253,9 +278,9 @@ def _train_worker(rank, world_size, args):
                     y_batch = batch[0].to(device)
                     y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
 
-                    _, loss_f_valid, loss_u_valid, _ = model.loss(
+                    _, loss_f_valid, loss_u_valid, _ = model.module.loss(
                         vel_batch, y_batch, UU0_batch, labels_batch,
-                        a, b, c, data_norm_coe, pde_norm_coe
+                        a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch
                     )
                     batch_u_loss.append(loss_u_valid.item())
                     batch_f_loss.append(loss_f_valid.item())
@@ -273,6 +298,8 @@ def _train_worker(rank, world_size, args):
             vel_test = plot_data["vel_test"]
             UU0_test = plot_data["UU0_test"]
             labels_test = plot_data["labels_test"]
+            freq_pred = plot_data["freq_valid"][0:1] if has_freq else None
+            freq_test = plot_data["freq_train"][0:1] if has_freq else None
 
             plot_loss(i, args.save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss)
 
@@ -288,9 +315,9 @@ def _train_worker(rank, world_size, args):
                               v_m_test, u0_m_test, lab_m_test, 'FT_Marmousi', if_fine_tune=True)
 
             test_plot(args, model.module, fno, i, dataloader["pred"],
-                      vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False)
+                      vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False, freq=freq_pred)
             test_plot(args, model.module, fno, i, dataloader["test"],
-                      vel_test, UU0_test, labels_test, 'train', if_fine_tune=False)
+                      vel_test, UU0_test, labels_test, 'train', if_fine_tune=False, freq=freq_test)
             plot_sinlge(model.module, args, 6, vel_test, UU0_test, labels_test)
 
             torch.cuda.empty_cache()

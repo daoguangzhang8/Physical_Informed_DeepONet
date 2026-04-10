@@ -280,7 +280,7 @@ def wrap_model_for_distributed(model, rank):
     import torch.nn.parallel.distributed as DDP
 
     model = model.to(rank)
-    model = DDP.DistributedDataParallel(model, device_ids=[rank])
+    model = DDP.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=False)
 
     return model
 
@@ -402,11 +402,13 @@ def Halton_Sample(array_shape, num_samples):
     return list(zip(rows, cols))
 
 
-def generate_random_points(batch_size, n_pts, range_max=72.0):
+def generate_random_points(batch_size, n_pts, range_max=None):
+    if range_max is None:
+        range_max = 72.0  # 默认值，建议使用实际的网格尺寸
     # 生成 [B, n_pts, 2] 的随机坐标，范围在 [0, 1] 之间
     y_random = torch.rand(batch_size, n_pts, 2)
-    
-    # 缩放到 [0, 72] 范围
+
+    # 缩放到 [0, range_max] 范围
     y_random = y_random * range_max
     
     # 记得开启梯度跟踪，否则无法计算 PDE Loss 中的导数

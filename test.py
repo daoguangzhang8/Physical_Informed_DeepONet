@@ -117,8 +117,8 @@ class Args_test:
     # ==========================================
     # 6. 物理网格与边界条件
     # ==========================================
-    nx = 70
-    nz = 70
+    nx = 70  # TODO: 改为 200 当使用 200x200 数据时
+    nz = 70  # TODO: 改为 200 当使用 200x200 数据时
     pml = True
     pml_total = 10
     pml_crop = 5
@@ -233,9 +233,10 @@ def prepare_external_val_dataset(args, prefix, loc_target, y_pred_grid):
     print(f'[*] 正在加载外部验证集: {prefix}')
     print(f'    - 文件前缀: {file_prefix}')
 
-    vel_ext = load_tensor_from_npy(args.load_path, f'{file_prefix}velocity_data_70_70_n1.npy')
-    UU0_ext = load_tensor_from_npy(args.load_path, f'{file_prefix}backgroundfield_data_freq5_1source_70_70_n1.npy')
-    UU_ext = load_tensor_from_npy(args.load_path, f'{file_prefix}wavefield_data_freq5_5sources_70_70_n1.npy')
+    grid_suffix = f'{args.nz}_{args.nx}_n1.npy'
+    vel_ext = load_tensor_from_npy(args.load_path, f'{file_prefix}velocity_data_{grid_suffix}')
+    UU0_ext = load_tensor_from_npy(args.load_path, f'{file_prefix}backgroundfield_data_freq5_1source_{grid_suffix}')
+    UU_ext = load_tensor_from_npy(args.load_path, f'{file_prefix}wavefield_data_freq5_5sources_{grid_suffix}')
 
     # 2. PML 边界处理
     if args.pml:

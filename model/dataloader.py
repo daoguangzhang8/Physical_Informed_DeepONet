@@ -270,10 +270,11 @@ def prepare_external_val_dataset(args, prefix, loc_target, y_pred_grid):
     """
     通用接口：用于动态加载和处理单个外部验证集（如 Marmousi, BP 等）
     """
-    # 1. 读取特定前缀的数据
-    vel_ext = load_tensor_from_npy(args.load_path, f'{prefix}velocity_data_70_70_n1.npy')
-    UU0_ext = load_tensor_from_npy(args.load_path, f'{prefix}backgroundfield_data_freq5_1source_70_70_n1.npy')
-    UU_ext = load_tensor_from_npy(args.load_path, f'{prefix}wavefield_data_freq5_5sources_70_70_n1.npy')
+    # 1. 读取特定前缀的数据 (文件名中尺寸需与实际数据匹配)
+    grid_suffix = f'{args.nz}_{args.nx}_n1.npy'
+    vel_ext = load_tensor_from_npy(args.load_path, f'{prefix}velocity_data_{grid_suffix}')
+    UU0_ext = load_tensor_from_npy(args.load_path, f'{prefix}backgroundfield_data_freq5_1source_{grid_suffix}')
+    UU_ext = load_tensor_from_npy(args.load_path, f'{prefix}wavefield_data_freq5_5sources_{grid_suffix}')
 
     # 2. PML 边界处理
     if args.pml:

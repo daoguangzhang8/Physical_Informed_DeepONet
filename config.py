@@ -13,22 +13,22 @@ class Args:
     # wavefield_filename = 'wavefield_data_freq5_5sources_70_70_n1.npy'
 
     # 自由表面训练数据
-    vel_filename = 'freesurface_velocity_freq5_1source_80_90_n1.npy'
-    backgroundfield_filename = 'freesurface_backgroundfield_freq5_1source_80_90_n1.npy'
-    wavefield_filename = 'freesurface_wavefield_freq5_1sources_80_90_n1.npy'
-    freq_filename = 'freesurface_freq_data_80_90_n1.npy'               # 频率数据 [N_vel]，每个速度模型对应一个频率
+    vel_filename = 'freesurface_velocity_freq3to20_5sources_160_180_pml20_n1.npy'
+    backgroundfield_filename = 'freesurface_backgroundfield_freq3to20_5sources_160_180_pml20_n1.npy'
+    wavefield_filename = 'freesurface_wavefield_freq3to20_5sources_160_180_pml20_n1.npy'
+    freq_filename = 'freesurface_freq_used_5sources_160_180_pml20_n1.npy'               # 频率数据 [N_vel]，每个速度模型对应一个频率
     default_freq = 5.0                                                 # 默认频率 (Hz)，当 freq 文件不存在或 freq_batch=None 时使用
     
     # 外部泛化测试集配置 (支持动态扩展)
     ext_val_datasets = {
-        'Marmousi': {'prefix': 'marmousi_', 'loc_target': 2},
+        # 'Marmousi': {'prefix': 'marmousi_', 'loc_target': 2},
         # 'BP': {'prefix': 'bp_', 'loc_target': 0},  
     }
     
     # ==========================================
     # 2. 硬件与设备配置 (Hardware & Device)
     # ==========================================
-    device = 3                                # 单 GPU 模式: 指定使用的 GPU 设备编号
+    device = 0                                # 单 GPU 模式: 指定使用的 GPU 设备编号
 
     # ==========================================
     # 2.1 单机多卡并行训练配置 (Single-Machine Multi-GPU)
@@ -64,22 +64,22 @@ class Args:
     # ==========================================
     # 5. 空间点采样模式配置 (Spatial Sampling Mode)
     # ==========================================
-    sampling_mode = 'full_grid'                 # 'full_grid': 全网格采样 | 'halton': Halton 准随机采样
-    halton_sample_ratio = 0.2                   # Halton 采样比例（仅在 sampling_mode='halton' 时生效，如 0.2 表示采样 20% 的网格点）
+    sampling_mode = 'halton'                 # 'full_grid': 全网格采样 | 'halton': Halton 准随机采样
+    halton_sample_ratio = 0.5                   # Halton 采样比例（仅在 sampling_mode='halton' 时生效，如 0.2 表示采样 20% 的网格点）
 
     # ==========================================
     # 5.1 数据集与批处理配置 (Dataset & Dataloader)
     # ==========================================
-    nvel_train = 1500                          # 训练所用的速度模型数量
+    nvel_train = 1500                            # 训练所用的速度模型数量
     ny_train = 4900                           # 训练集空间采样点总数
     batch_size = 700                          # Trunk Net 坐标采样批次大小 (num_sample)
-    batch_size_v = 35                          # Branch Net 速度场/背景场批次大小 (Batch_v)
+    batch_size_v = 30                          # Branch Net 速度场/背景场批次大小 (Batch_v)
     
     valid_rate = 0.1                          # 验证集划分比例
     validate_every = 100                      # 每隔多少个 epoch 执行一次模型验证
     valid_batch_size = 350                    # 验证集坐标采样批次大小
     valid_batch_size_v = 6                    # 验证集速度场批次大小
-    accumulation_steps = 4                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
+    accumulation_steps = 1                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
 
     source_list = [0, 1, 2, 3, 4]                 # 训练数据中包含的震源编号列表 (0-4 共5个震源)  
     # ==========================================
@@ -90,11 +90,11 @@ class Args:
     # ==========================================
     # 6. 物理网格与边界条件 (Physical Grid & PML Boundaries)
     # ==========================================
-    nx = 70                                   # 物理模型 x 方向网格数 (不含外延 PML)
-    nz = 70                                   # 物理模型 z 方向网格数 (不含外延 PML)
+    nx = 140                                   # 物理模型 x 方向网格数 (不含外延 PML)
+    nz = 140                                   # 物理模型 z 方向网格数 (不含外延 PML)
     pml = True                                # 是否启用 PML (Perfectly Matched Layer, 完美匹配层) 吸收边界
-    pml_total = 10                            # PML 吸收层的总网格厚度
-    pml_crop = 5                              # 训练时裁剪/忽略的 PML 网格数
+    pml_total = 20                            # PML 吸收层的总网格厚度
+    pml_crop = 15                              # 训练时裁剪/忽略的 PML 网格数
     pml_active = pml_total - pml_crop         # 剩余参与训练的 PML 网格数
 
     # 边界类型配置
