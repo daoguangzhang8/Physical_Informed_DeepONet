@@ -280,7 +280,7 @@ def wrap_model_for_distributed(model, rank):
     import torch.nn.parallel.distributed as DDP
 
     model = model.to(rank)
-    model = DDP.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=False)
+    model = DDP.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=True)
 
     return model
 

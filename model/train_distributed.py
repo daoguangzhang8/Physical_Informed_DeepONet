@@ -102,6 +102,10 @@ def _train_worker(rank, world_size, args):
         model._init_weights()
         print(f"PI_DeepONet 模型总参数数量: {count_parameters(model)}")
 
+    # 广播所有参数从 rank 0 到其他 rank (必须在 DDP wrap 之前)
+    for param in model.parameters():
+        dist.broadcast(param.data, src=0)
+
     # 包装模型为 DDP
     model = wrap_model_for_distributed(model, rank)
     if is_main_process(rank):
@@ -153,8 +157,6 @@ def _train_worker(rank, world_size, args):
     else:
         pbar = range(args.NIter)
 
-    step_counter = 0
-
     for i in pbar:
         # 动态调整损失权重
         if args.if_adjust and i > args.adjust_from and (i - args.adjust_from) % args.adjust_every == 0:
@@ -188,34 +190,47 @@ def _train_worker(rank, world_size, args):
             with torch.no_grad():
                 y_ran = model.module.generate_structure_aware_y_ran(vel_batch, num_pts=900)
 
-            for batch in dataloader['train_y']:
+            # 预收集 coordinate batches 以确定总数
+            coord_batches = list(dataloader['train_y'])
+            n_coord = len(coord_batches)
+
+            for idx, batch in enumerate(coord_batches):
                 y_batch = batch[0].to(device)
                 y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
 
-                loss, loss_f, loss_u, loss_r = model.module.loss(
-                    vel_batch, y_batch, UU0_batch, labels_batch,
-                    a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch,
-                    y_ran=y_ran
+                # 拼接数据坐标和 PDE 采样坐标
+                y_combined = torch.cat([y_batch, y_ran], dim=1)
+                y_combined.requires_grad_(True)
+
+                # 通过 DDP wrapper 调用 forward (触发梯度同步 hook)
+                Delta_U = model(vel_batch, y_combined, UU0_batch)
+
+                # 计算损失 (不调用 forward)
+                loss, loss_f, loss_u, loss_r = model.module.compute_loss(
+                    Delta_U, vel_batch, y_batch, UU0_batch, labels_batch,
+                    y_combined, a, b, c, data_norm_coe, pde_norm_coe,
+                    freq_batch=freq_batch
                 )
 
-                loss = loss / args.accumulation_steps
+                loss = loss / n_coord
 
-                # 仅在累加的最后一步同步梯度，中间步跳过以减少通信开销
-                step_counter += 1
-                if step_counter % args.accumulation_steps == 0:
-                    loss.backward()       # 最后一步：同步梯度
-                    optimizer.step()
-                    optimizer.zero_grad()
-                else:
+                # 梯度同步策略: 仅最后一个 coord batch 触发 DDP all-reduce
+                if idx < n_coord - 1:
                     with model.no_sync():
-                        loss.backward()   # 中间步：跳过同步
+                        loss.backward()
+                else:
+                    loss.backward()           # all-reduce 在此触发
 
-                batch_loss.append(loss.item() * args.accumulation_steps)
+                batch_loss.append(loss.item() * n_coord)
                 batch_u_loss.append(loss_u.item())
                 batch_f_loss.append(loss_f.item())
                 batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
 
-                del loss, loss_f, loss_u, loss_r, y_batch
+                del loss, loss_f, loss_u, loss_r, y_batch, Delta_U
+
+            # 每个 velocity batch 结束后更新参数
+            optimizer.step()
+            optimizer.zero_grad()
 
         # 跨进程平均损失
         avg_loss = np.mean(batch_loss) if batch_loss else 0
