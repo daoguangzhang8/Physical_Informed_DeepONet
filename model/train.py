@@ -181,9 +181,9 @@ def train(args):
             # ==========================================
             if i % args.validate_every == 0:
                 model.eval()
-                batch_u_loss, batch_f_loss = [], [] 
-                
-                 
+                batch_u_loss, batch_f_loss = [], []
+
+
                 for batch_data in dataloader['valid']:
                     if has_freq:
                         vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
@@ -205,9 +205,9 @@ def train(args):
                         )
                         batch_u_loss.append(loss_u_valid.item())
                         batch_f_loss.append(loss_f_valid.item())
-                            
+
                 valid_u_loss.append(np.mean(batch_u_loss) if batch_u_loss else 0.0)
-                valid_f_loss.append(np.mean(batch_f_loss) if batch_f_loss else 1.0) 
+                valid_f_loss.append(np.mean(batch_f_loss) if batch_f_loss else 1.0)
 
             # ==========================================
             # 6. 可视化与绘图

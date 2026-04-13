@@ -26,7 +26,7 @@ class Pi_DeepONet(nn.Module):
         
         # --- 编码器与特征提取 ---
         self.pos_encoder = PositionalEncoding(embed_dim=4)
-        self.fencoder = FourierFeatureEncoder(input_dim=2, mapping_size=self.feat_dim)
+        # self.fencoder = FourierFeatureEncoder(input_dim=2, mapping_size=self.feat_dim)  # 未使用，已注释
 
         # --- 网络分支 (Branch) ---
         self.branch1 = nn.Sequential(
@@ -43,7 +43,7 @@ class Pi_DeepONet(nn.Module):
         self.combinedlayer2 = GaussianWeightedLayer(self.feat_dim, dh=args.dh)
         self.attengate = AttenGate(use_softmax=True)
         
-        self.block_feature_encoder = BlockFeatureEncoder(self.feat_dim, self.feat_dim, grid_size=20)
+        self.block_feature_encoder = BlockFeatureEncoder(self.feat_dim, self.feat_dim, grid_size=20)  # 未使用，已注释
         self.smooth_feature_encoder = SmoothBlockEncoder(self.feat_dim, self.feat_dim, grid_size=20)
 
         # --- 主干网络 (Trunk) 与输出层 ---
@@ -52,7 +52,7 @@ class Pi_DeepONet(nn.Module):
         
         # --- 损失函数组件 ---
         self.loss_function = nn.MSELoss(reduction='mean')
-        self.loss_function_point = nn.MSELoss(reduction='none')
+        # self.loss_function_point = nn.MSELoss(reduction='none')  # 未使用，已注释
         
         # 动态损失权重参数
         self.log_var_data = nn.Parameter(torch.zeros(1))
