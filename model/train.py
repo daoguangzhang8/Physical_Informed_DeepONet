@@ -70,13 +70,25 @@ def train(args):
         data_norm_coe = 1.
 
         # ==========================================
+        # 3.5 Sobol 引擎初始化 (仅 sobol 模式)
+        # ==========================================
+        use_sobol = getattr(args, 'sampling_strategy', 'original') == 'sobol'
+        if use_sobol:
+            sobol_engine = torch.quasirandom.SobolEngine(dimension=2, scramble=True)
+            valid_sobol_engine = torch.quasirandom.SobolEngine(dimension=2, scramble=True)
+            sobol_scale = torch.tensor([args.nz * args.dh, args.nx * args.dh], dtype=torch.float32)
+            sobol_pts = getattr(args, 'sobol_points_per_epoch', 800)
+            valid_sobol_pts = getattr(args, 'valid_sobol_points', 800)
+            print(f"Sobol 模式: 每 epoch {sobol_pts} 点 (所有 velocity batch 共享), 验证 {valid_sobol_pts} 点")
+
+        # ==========================================
         # 4. 主训练循环 (引入 tqdm 进度条与显存优化)
         # ==========================================
         optimizer.zero_grad()
         pbar = tqdm(range(args.NIter), desc="Training Progress", dynamic_ncols=True)
-        
+
         # 新增：用于全局记录 Batch 步数，确保梯度累加逻辑正确
-        step_counter = 0  
+        step_counter = 0
         
         for i in pbar:
             # 动态调整损失权重 a
@@ -87,7 +99,12 @@ def train(args):
 
             model.train()
             batch_loss, batch_u_loss, batch_f_loss, batch_r_loss = [], [], [], []
-            
+
+            # Sobol 模式: 每 epoch 开头生成一组坐标, 所有 velocity batch 共享
+            if use_sobol:
+                y_sobol_base = sobol_engine.draw(sobol_pts).to(device)
+                y_sobol_base = y_sobol_base * sobol_scale.to(device)
+
             # 遍历训练数据
             has_freq = len(dataloader['train'].dataset.tensors) >= 4
             for batch_data in dataloader['train']:
@@ -106,40 +123,62 @@ def train(args):
                 else:
                     labels_batch = labels_batch.to(device)
 
-                # 针对每个空间坐标点集计算损失
-                # 每个 velocity batch 只生成一次自适应采样点
-                with torch.no_grad():
-                    y_ran = model.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+                if use_sobol:
+                    # ------ Sobol 模式: 单次前向, 无内层循环 ------
+                    y_sobol = y_sobol_base.unsqueeze(0).expand(vel_batch.shape[0], -1, -1).clone()
+                    y_sobol.requires_grad_(True)
 
-                for batch in dataloader['train_y']:
-                    y_batch = batch[0].to(device)
-                    y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
-
-                    # 前向传播与计算损失
                     loss, loss_f, loss_u, loss_r = model.loss(
-                        vel_batch, y_batch, UU0_batch, labels_batch,
+                        vel_batch, y_sobol, UU0_batch, labels_batch,
                         a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch,
-                        y_ran=y_ran
+                        y_ran=None
                     )
 
-                    # 梯度累加与反向传播
-                    loss = loss / args.accumulation_steps
                     loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                    # 修复：使用 step_counter 而不是 epoch i 来判断是否更新梯度
-                    step_counter += 1
-                    if step_counter % args.accumulation_steps == 0:
-                        optimizer.step()
-                        optimizer.zero_grad()
-
-                    # 记录真实损失值
-                    batch_loss.append(loss.item() * args.accumulation_steps)
+                    batch_loss.append(loss.item())
                     batch_u_loss.append(loss_u.item())
                     batch_f_loss.append(loss_f.item())
                     batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
 
-                    # 新增：手动切断引用，立即释放该 sub-batch 的巨大计算图，极大降低显存占用
-                    del loss, loss_f, loss_u, loss_r, y_batch
+                    del loss, loss_f, loss_u, loss_r, y_sobol
+
+                else:
+                    # ------ Original 模式: 双层循环 + 梯度累加 ------
+                    with torch.no_grad():
+                        y_ran = model.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+
+                    for batch in dataloader['train_y']:
+                        y_batch = batch[0].to(device)
+                        y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
+
+                        # 前向传播与计算损失
+                        loss, loss_f, loss_u, loss_r = model.loss(
+                            vel_batch, y_batch, UU0_batch, labels_batch,
+                            a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch,
+                            y_ran=y_ran
+                        )
+
+                        # 梯度累加与反向传播
+                        loss = loss / args.accumulation_steps
+                        loss.backward()
+
+                        # 修复：使用 step_counter 而不是 epoch i 来判断是否更新梯度
+                        step_counter += 1
+                        if step_counter % args.accumulation_steps == 0:
+                            optimizer.step()
+                            optimizer.zero_grad()
+
+                        # 记录真实损失值
+                        batch_loss.append(loss.item() * args.accumulation_steps)
+                        batch_u_loss.append(loss_u.item())
+                        batch_f_loss.append(loss_f.item())
+                        batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
+
+                        # 新增：手动切断引用，立即释放该 sub-batch 的巨大计算图，极大降低显存占用
+                        del loss, loss_f, loss_u, loss_r, y_batch
 
             # ------------------------------------------
             # 记录当前 Epoch 损失并更新进度条显示
@@ -183,7 +222,6 @@ def train(args):
                 model.eval()
                 batch_u_loss, batch_f_loss = [], []
 
-
                 for batch_data in dataloader['valid']:
                     if has_freq:
                         vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
@@ -195,16 +233,32 @@ def train(args):
                     UU0_batch = UU0_batch.to(device)
                     labels_batch = labels_batch.to(device)
 
-                    for batch in dataloader['valid_y']:
-                        y_batch = batch[0].to(device)
-                        y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
+                    if use_sobol:
+                        # Sobol 验证: 单次前向, 无内层循环
+                        y_valid = valid_sobol_engine.draw(valid_sobol_pts).to(device)
+                        y_valid = y_valid * sobol_scale.to(device)
+                        y_valid = y_valid.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
 
                         _, loss_f_valid, loss_u_valid, _ = model.loss(
-                            vel_batch, y_batch, UU0_batch, labels_batch,
+                            vel_batch, y_valid, UU0_batch, labels_batch,
                             a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch
                         )
                         batch_u_loss.append(loss_u_valid.item())
                         batch_f_loss.append(loss_f_valid.item())
+
+                        del loss_f_valid, loss_u_valid, y_valid
+                    else:
+                        # Original 验证: 内层循环遍历 valid_y
+                        for batch in dataloader['valid_y']:
+                            y_batch = batch[0].to(device)
+                            y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
+
+                            _, loss_f_valid, loss_u_valid, _ = model.loss(
+                                vel_batch, y_batch, UU0_batch, labels_batch,
+                                a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch
+                            )
+                            batch_u_loss.append(loss_u_valid.item())
+                            batch_f_loss.append(loss_f_valid.item())
 
                 valid_u_loss.append(np.mean(batch_u_loss) if batch_u_loss else 0.0)
                 valid_f_loss.append(np.mean(batch_f_loss) if batch_f_loss else 1.0)

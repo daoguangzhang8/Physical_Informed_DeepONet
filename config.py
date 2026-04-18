@@ -56,7 +56,7 @@ class Args:
     # ==========================================
     # 4. 数据集与采样 (Dataset & Sampling)
     # ==========================================
-    nvel_train = 1                            # 训练所用的速度模型数量
+    nvel_train = 1500                            # 训练所用的速度模型数量
     source_list = [0, 1, 2, 3, 4]                         # [0, 1, 2, 3, 4] 训练数据中包含的震源编号列表 (0-4 共5个震源)
 
     # 空间点采样模式
@@ -65,7 +65,7 @@ class Args:
 
     # 批处理配置
     batch_size = 800                          # Trunk Net 坐标采样批次大小 (num_sample)
-    batch_size_v = 1                          # Branch Net 速度场/背景场批次大小 (Batch_v)
+    batch_size_v = 8                          # Branch Net 速度场/背景场批次大小 (Batch_v)
     ny_train = int(nz * nx * halton_sample_ratio)  # 训练集空间采样点总数 (由网格尺寸和采样比例自动计算)
     accumulation_steps = 4                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
 
@@ -85,7 +85,7 @@ class Args:
     warmup_epochs = 100                       # 学习率热身 (Warmup) 的 epoch 数
     factor = 0.9                              # 学习率衰减因子
     patience = 30                             # 触发衰减的容忍 epoch 数量
-    min_lr = 1e-7                             # 允许的最小学习率
+    min_lr = 1e-6                             # 允许的最小学习率
 
     # ==========================================
     # 6. 损失函数 (Loss Function)
@@ -126,3 +126,10 @@ class Args:
     input_shape_trunk = (batch_size, in_channels, 1, 2)       # Trunk Net (评估坐标) 的输入形状占位
     input_shape_branch1 = (batch_size, in_channels_vel, nz, nx) # Branch Net 1 (速度场) 输入形状占位
     input_shape_branch2 = (batch_size, in_channels, nz, nx)     # Branch Net 2 (背景场/震源) 输入形状占位
+
+    # ==========================================
+    # 10. Sobol 采样配置 (Sobol Sampling)
+    # ==========================================
+    sampling_strategy = 'sobol'               # 'original': 双层循环+Halton | 'sobol': 单层循环+Sobol
+    sobol_points_per_epoch = 10000              # Sobol 模式: 每 epoch 采样点数 (所有 velocity batch 共享)
+    valid_sobol_points = 300                  # Sobol 模式: 验证集每 epoch 采样点数
