@@ -42,8 +42,7 @@ class Pi_DeepONet(nn.Module):
         self.combinedlayer1 = GaussianWeightedLayer(self.feat_dim, dh=args.dh)
         self.combinedlayer2 = GaussianWeightedLayer(self.feat_dim, dh=args.dh)
         self.attengate = AttenGate(use_softmax=True)
-        
-        self.block_feature_encoder = BlockFeatureEncoder(self.feat_dim, self.feat_dim, grid_size=20)  # 未使用，已注释
+
         self.smooth_feature_encoder = SmoothBlockEncoder(self.feat_dim, self.feat_dim, grid_size=20)
 
         # --- 主干网络 (Trunk) 与输出层 ---
@@ -53,10 +52,6 @@ class Pi_DeepONet(nn.Module):
         # --- 损失函数组件 ---
         self.loss_function = nn.MSELoss(reduction='mean')
         # self.loss_function_point = nn.MSELoss(reduction='none')  # 未使用，已注释
-        
-        # 动态损失权重参数
-        self.log_var_data = nn.Parameter(torch.zeros(1))
-        self.log_var_pde = nn.Parameter(torch.zeros(1))
 
         self._init_weights()
 
@@ -417,7 +412,7 @@ class Pi_DeepONet(nn.Module):
 
         Args:
             freq_batch: 每个样本对应的频率值 [B_v]。若为 None 则使用默认值。
-            y_ran: 预计算的自适应采样点 [B_v, N_ran, 2]。若为 None 则内部生成。
+            y_ran: 预计算的自适应采样点 [B_v, N_ran, 2]。若提供则拼接到 y 后；若为 None 则不生成。
         """
         batch_size_v = vel.shape[0]
         nz, nx = vel.shape[2], vel.shape[3]
@@ -428,13 +423,14 @@ class Pi_DeepONet(nn.Module):
         x_coord = (y[:, :, 1] / self.args.dh).long().clamp(0, nx - 1)
         labels = labels[batch_idx, :, z_coord, x_coord]  # [B_v, 2, B_pts] -> [B_v, B_pts, 2]
 
-        # 2. 生成自适应物理采样点 (若未提供则重新生成)
-        if y_ran is None:
-            y_ran = self.generate_structure_aware_y_ran(vel, num_pts=900, max_z=nz, max_x=nx)
-
-        y_combined = torch.cat([y, y_ran], dim=1)  # [B_v, B_pts + B_ran_pts, 2]
-        y_combined.requires_grad_(True)
+        # 2. 拼接自适应采样点 (仅当显式提供 y_ran 时)
         n_y = y.shape[1]
+        if y_ran is not None and y_ran.shape[1] > 0:
+            y_combined = torch.cat([y, y_ran], dim=1)
+        else:
+            y_combined = y
+
+        y_combined.requires_grad_(True)
 
         # 3. 只做一次 forward pass (服务于 BC loss 和 PDE loss)
         Delta_U = self.forward(vel, y_combined, UU0)
