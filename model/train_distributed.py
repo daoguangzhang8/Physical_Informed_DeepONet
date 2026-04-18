@@ -170,6 +170,10 @@ def _train_worker(rank, world_size, args):
         # 设置 epoch 以确保每个 epoch shuffle 不同
         dataloader['train'].sampler.set_epoch(i)
 
+        # 预收集 coordinate batches（每 epoch 一次，避免在 velocity 循环内重复物化）
+        coord_batches = list(dataloader['train_y'])
+        n_coord = len(coord_batches)
+
         # 遍历训练数据
         for batch_data in dataloader['train']:
             if has_freq:
@@ -189,10 +193,6 @@ def _train_worker(rank, world_size, args):
             # 每个 velocity batch 只生成一次自适应采样点
             with torch.no_grad():
                 y_ran = model.module.generate_structure_aware_y_ran(vel_batch, num_pts=900)
-
-            # 预收集 coordinate batches 以确定总数
-            coord_batches = list(dataloader['train_y'])
-            n_coord = len(coord_batches)
 
             for idx, batch in enumerate(coord_batches):
                 y_batch = batch[0].to(device)
