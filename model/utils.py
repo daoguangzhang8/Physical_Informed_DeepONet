@@ -569,3 +569,121 @@ def build_epoch_velocity_gradient_prob(
 
     return prob, score
 
+def sample_shared_y_ran_from_epoch_prob(
+    prob,
+    args,
+    num_pts=900,
+    structure_ratio=0.60,
+    surface_ratio=0.20,
+    uniform_ratio=0.20,
+    source_ratio=0.0,
+    source_coords=None,
+    surface_depth_grids=5,
+    source_r_min_grids=1.5,
+    source_r_max_grids=8.0,
+    replacement=True,
+):
+    """
+    从 epoch-level 概率图中采样一组共享 y_ran。
+    """
+    device = prob.device
+    nz, nx, dh = args.nz, args.nx, args.dh
+
+    max_z = nz * dh
+    max_x = nx * dh
+
+    if source_coords is None or source_ratio <= 0:
+        uniform_ratio = uniform_ratio + source_ratio
+        source_ratio = 0.0
+
+    num_structure = int(num_pts * structure_ratio)
+    num_surface = int(num_pts * surface_ratio)
+    num_source = int(num_pts * source_ratio)
+    num_uniform = num_pts - num_structure - num_surface - num_source
+
+    y_parts = []
+
+    # 1. epoch-level structure points
+    if num_structure > 0:
+        sampled_indices = torch.multinomial(
+            prob,
+            num_samples=num_structure,
+            replacement=replacement,
+        )
+
+        z_idx = sampled_indices // nx
+        x_idx = sampled_indices % nx
+
+        z = z_idx.float() * dh + torch.rand(num_structure, device=device) * dh
+        x = x_idx.float() * dh + torch.rand(num_structure, device=device) * dh
+
+        z = z.clamp(0.0, max_z)
+        x = x.clamp(0.0, max_x)
+
+        y_struct = torch.stack([z, x], dim=-1)
+        y_parts.append(y_struct)
+
+    # 2. surface points
+    if num_surface > 0:
+        surface_depth = surface_depth_grids * dh
+
+        z = torch.rand(num_surface, device=device) * surface_depth
+        x = torch.rand(num_surface, device=device) * max_x
+
+        z = z.clamp(0.0, max_z)
+        x = x.clamp(0.0, max_x)
+
+        y_surface = torch.stack([z, x], dim=-1)
+        y_parts.append(y_surface)
+
+    # 3. source-near points
+    if num_source > 0 and source_coords is not None:
+        source_coords = source_coords.to(device)
+
+        src_id = torch.randint(
+            low=0,
+            high=source_coords.shape[0],
+            size=(num_source,),
+            device=device,
+        )
+        src = source_coords[src_id]
+
+        theta = 2.0 * torch.pi * torch.rand(num_source, device=device)
+
+        r_min = source_r_min_grids * dh
+        r_max = source_r_max_grids * dh
+        r = r_min + (r_max - r_min) * torch.rand(num_source, device=device)
+
+        z = src[:, 0] + r * torch.cos(theta)
+        x = src[:, 1] + r * torch.sin(theta)
+
+        z = z.clamp(0.0, max_z)
+        x = x.clamp(0.0, max_x)
+
+        y_source = torch.stack([z, x], dim=-1)
+        y_parts.append(y_source)
+
+    # 4. uniform points
+    if num_uniform > 0:
+        z = torch.rand(num_uniform, device=device) * max_z
+        x = torch.rand(num_uniform, device=device) * max_x
+
+        z = z.clamp(0.0, max_z)
+        x = x.clamp(0.0, max_x)
+
+        y_uniform = torch.stack([z, x], dim=-1)
+        y_parts.append(y_uniform)
+
+    y_shared = torch.cat(y_parts, dim=0)
+
+    if y_shared.shape[0] > num_pts:
+        y_shared = y_shared[:num_pts]
+    elif y_shared.shape[0] < num_pts:
+        extra = num_pts - y_shared.shape[0]
+        z = torch.rand(extra, device=device) * max_z
+        x = torch.rand(extra, device=device) * max_x
+        y_extra = torch.stack([z, x], dim=-1)
+        y_shared = torch.cat([y_shared, y_extra], dim=0)
+
+    return y_shared
+
