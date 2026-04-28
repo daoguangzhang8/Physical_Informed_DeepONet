@@ -501,6 +501,71 @@ def get_helmholtz_spatial_weights(coords, velocity, omega, source_loc, alpha=0.1
     # 我们希望：在源附近权重极大（强制收敛），在全域受算子平衡项调节
     # 这里加 1e-2 是为了保证全域仍有基本的 PDE 约束，不至于震源之外完全不更新
     weights = operator_term * (source_anchor + 1e-2)
-    
+
     return weights
+
+def build_epoch_velocity_gradient_prob(
+    train_loader,
+    device,
+    eps=1e-8,
+    use_max_mix=False,
+    mean_weight=0.7,
+    max_weight=0.3,
+):
+    """
+    基于整个训练集 velocity model 构造 epoch-level 结构采样概率图。
+
+    Args:
+        train_loader: 训练数据 DataLoader，每个 batch 至少包含 vel 在 index 0
+        device: 计算设备
+        eps: 数值稳定项
+        use_max_mix: True 时 score = mean_weight*mean + max_weight*max
+        mean_weight: mean+max 混合的 mean 权重
+        max_weight: mean+max 混合的 max 权重
+
+    Returns:
+        prob: [Z*X] 扁平概率分布，归一化后 sum=1
+        score: [Z, X] 原始分数图（用于可视化诊断）
+    """
+    score_sum = None
+    score_max_global = None
+    count = 0
+
+    with torch.no_grad():
+        for batch_data in train_loader:
+            vel_batch = batch_data[0]
+            vel = vel_batch.to(device)  # [B, 1, Z, X]
+            B, _, Z, X = vel.shape
+
+            grad_z = vel[:, :, 2:, 1:-1] - vel[:, :, :-2, 1:-1]
+            grad_x = vel[:, :, 1:-1, 2:] - vel[:, :, 1:-1, :-2]
+
+            grad_mag = torch.sqrt(grad_z ** 2 + grad_x ** 2 + eps)
+            grad_mag = F.pad(grad_mag, (1, 1, 1, 1), mode='replicate').squeeze(1)  # [B, Z, X]
+
+            batch_sum = grad_mag.sum(dim=0)  # [Z, X]
+
+            if score_sum is None:
+                score_sum = torch.zeros_like(batch_sum)
+                score_max_global = torch.zeros_like(batch_sum)
+
+            score_sum += batch_sum
+            count += B
+
+            if use_max_mix:
+                batch_max = grad_mag.max(dim=0).values
+                score_max_global = torch.maximum(score_max_global, batch_max)
+
+    score_mean = score_sum / max(count, 1)
+
+    if use_max_mix:
+        score = mean_weight * score_mean + max_weight * score_max_global
+    else:
+        score = score_mean
+
+    score = torch.clamp(score, min=0.0)
+    prob = score.reshape(-1)
+    prob = prob / (prob.sum() + eps)
+
+    return prob, score
 
