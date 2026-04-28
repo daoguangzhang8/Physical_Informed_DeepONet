@@ -23,7 +23,9 @@ from model.utils import (
     cleanup_distributed,
     wrap_model_for_distributed,
     is_main_process,
-    reduce_tensor
+    reduce_tensor,
+    build_epoch_velocity_gradient_prob,
+    sample_shared_y_ran_from_epoch_prob,
 )
 from model.dataloader import prepare_training_dataloaders, prepare_external_val_dataset
 from model.PI_DeepOnet import Pi_DeepONet
@@ -138,13 +140,18 @@ def _train_worker(rank, world_size, args):
     # ==========================================
     # 训练状态初始化
     # ==========================================
-    loss_log, loss_pde_log, loss_data_log, loss_reg_log = [], [], [], []
+    loss_log, loss_pde_log, loss_data_log, loss_reg_log, loss_env_log = [], [], [], [], []
     valid_u_loss, valid_f_loss = [], []
 
-    a, b, c = args.a, args.b, args.c
+    # epoch-level 共享 y_ran 采样状态
+    epoch_prob = None
+    epoch_score = None
+
+    a, b, c, d = args.a, args.b, args.c, args.d
     first_flag = True
     pde_norm_coe = 1.
     data_norm_coe = 1.
+    env_norm_coe = 1.
 
     # ==========================================
     # 主训练循环
@@ -165,7 +172,7 @@ def _train_worker(rank, world_size, args):
             b, c = 1, 0
 
         model.train()
-        batch_loss, batch_u_loss, batch_f_loss, batch_r_loss = [], [], [], []
+        batch_loss, batch_u_loss, batch_f_loss, batch_r_loss, batch_env_loss = [], [], [], [], []
 
         # 设置 epoch 以确保每个 epoch shuffle 不同
         dataloader['train'].sampler.set_epoch(i)
@@ -190,9 +197,40 @@ def _train_worker(rank, world_size, args):
             else:
                 labels_batch = labels_batch.to(device)
 
-            # 每个 velocity batch 只生成一次自适应采样点
-            with torch.no_grad():
-                y_ran = model.module.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+            # 每个 velocity batch 生成一组共享 y_ran
+            if getattr(args, 'use_epoch_shared_y_ran', False):
+                should_update_prob = (
+                    epoch_prob is None
+                    or args.y_ran_prob_update_every == 1
+                    or (args.y_ran_prob_update_every > 1 and i % args.y_ran_prob_update_every == 0)
+                )
+                if should_update_prob:
+                    with torch.no_grad():
+                        epoch_prob, epoch_score = build_epoch_velocity_gradient_prob(
+                            train_loader=dataloader['train'],
+                            device=device,
+                            use_max_mix=args.y_ran_use_max_mix,
+                            mean_weight=args.y_ran_mean_weight,
+                            max_weight=args.y_ran_max_weight,
+                        )
+
+                with torch.no_grad():
+                    y_shared = sample_shared_y_ran_from_epoch_prob(
+                        prob=epoch_prob,
+                        args=args,
+                        num_pts=args.y_ran_num_pts,
+                        structure_ratio=args.y_ran_structure_ratio,
+                        surface_ratio=args.y_ran_surface_ratio,
+                        uniform_ratio=args.y_ran_uniform_ratio,
+                        source_ratio=args.y_ran_source_ratio,
+                        surface_depth_grids=args.y_ran_surface_depth_grids,
+                    )
+                y_ran = y_shared.unsqueeze(0).expand(
+                    vel_batch.shape[0], -1, -1
+                ).clone().requires_grad_(True)
+            else:
+                with torch.no_grad():
+                    y_ran = model.module.generate_structure_aware_y_ran(vel_batch, num_pts=900)
 
             for idx, batch in enumerate(coord_batches):
                 y_batch = batch[0].to(device)
@@ -203,12 +241,12 @@ def _train_worker(rank, world_size, args):
                 y_combined.requires_grad_(True)
 
                 # 通过 DDP wrapper 调用 forward (触发梯度同步 hook)
-                Delta_U = model(vel_batch, y_combined, UU0_batch)
+                Delta_U = model(vel_batch, y_combined, UU0_batch, freq_batch=freq_batch)
 
                 # 计算损失 (不调用 forward)
-                loss, loss_f, loss_u, loss_r = model.module.compute_loss(
+                loss, loss_f, loss_u, loss_r, loss_env = model.module.compute_loss(
                     Delta_U, vel_batch, y_batch, UU0_batch, labels_batch,
-                    y_combined, a, b, c, data_norm_coe, pde_norm_coe,
+                    y_combined, a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
                     freq_batch=freq_batch
                 )
 
@@ -225,8 +263,9 @@ def _train_worker(rank, world_size, args):
                 batch_u_loss.append(loss_u.item())
                 batch_f_loss.append(loss_f.item())
                 batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
+                batch_env_loss.append(loss_env.item())
 
-                del loss, loss_f, loss_u, loss_r, y_batch, Delta_U
+                del loss, loss_f, loss_u, loss_r, loss_env, y_batch, Delta_U
 
             # 每个 velocity batch 结束后更新参数
             optimizer.step()
@@ -241,17 +280,22 @@ def _train_worker(rank, world_size, args):
         loss_tensor = reduce_tensor(loss_tensor, op=dist.ReduceOp.SUM)
         avg_loss, avg_u_loss, avg_f_loss = loss_tensor.cpu().numpy()
 
+        avg_env_loss = np.mean(batch_env_loss) if batch_env_loss else 0
+
         if first_flag:
             data_norm_coe = avg_u_loss if avg_u_loss > 0 else 1.0
             pde_norm_coe = avg_f_loss if avg_f_loss > 0 else 1.0
+            env_norm_coe = avg_env_loss if avg_env_loss > 0 else 1.0
             loss_log.append(a + b)
             loss_data_log.append(1.)
             loss_pde_log.append(1.)
+            loss_env_log.append(1.)
             first_flag = False
         else:
             loss_log.append(avg_loss)
             loss_data_log.append(avg_u_loss)
             loss_pde_log.append(avg_f_loss)
+            loss_env_log.append(avg_env_loss)
             loss_reg_log.append(np.mean(batch_r_loss) / (args.batch_size * args.batch_size_v) if batch_r_loss else 0)
 
         # 更新进度条 (只在主进程)
@@ -261,6 +305,7 @@ def _train_worker(rank, world_size, args):
                 'Total': f"{avg_loss:.4e}",
                 'PDE': f"{loss_pde_log[-1]:.4e}",
                 'Data': f"{loss_data_log[-1]:.4e}",
+                'Env': f"{loss_env_log[-1]:.4e}",
                 'LR': f"{current_lr:.2e}",
                 'GPU': f"{world_size}"
             })
@@ -293,9 +338,9 @@ def _train_worker(rank, world_size, args):
                     y_batch = batch[0].to(device)
                     y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
 
-                    _, loss_f_valid, loss_u_valid, _ = model.module.loss(
+                    _, loss_f_valid, loss_u_valid, _, _ = model.module.loss(
                         vel_batch, y_batch, UU0_batch, labels_batch,
-                        a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_batch
+                        a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe, freq_batch=freq_batch
                     )
                     batch_u_loss.append(loss_u_valid.item())
                     batch_f_loss.append(loss_f_valid.item())
@@ -333,7 +378,7 @@ def _train_worker(rank, world_size, args):
                       vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False, freq=freq_pred)
             test_plot(args, model.module, fno, i, dataloader["test"],
                       vel_test, UU0_test, labels_test, 'train', if_fine_tune=False, freq=freq_test)
-            plot_sinlge(model.module, args, 6, vel_test, UU0_test, labels_test)
+            plot_sinlge(model.module, args, 6, vel_test, UU0_test, labels_test, freq=freq_test)
 
             torch.cuda.empty_cache()
             gc.collect()
@@ -355,6 +400,7 @@ def _train_worker(rank, world_size, args):
             np.save(os.path.join(args.save_doc, 'loss_log.npy'), loss_log)
             np.save(os.path.join(args.save_doc, 'loss_data_log.npy'), loss_data_log)
             np.save(os.path.join(args.save_doc, 'loss_pde_log.npy'), loss_pde_log)
+            np.save(os.path.join(args.save_doc, 'loss_env_log.npy'), loss_env_log)
 
     # ==========================================
     # 最终保存与清理
