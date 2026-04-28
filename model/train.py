@@ -96,6 +96,10 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
     step_counter = 0
     pbar = tqdm(range(stage_niter), desc=f"Stage {stage_idx} [{stage_name}]", dynamic_ncols=True)
 
+    # epoch-level 共享 y_ran 采样状态
+    epoch_prob = None
+    epoch_score = None
+
     for i in pbar:
         if args.if_adjust and i > args.adjust_from and (i - args.adjust_from) % args.adjust_every == 0:
             decay_times = i // args.adjust_every
@@ -148,8 +152,40 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
                 del loss, loss_f, loss_u, loss_r, loss_env, y_sobol
 
             else:
-                with torch.no_grad():
-                    y_ran = model.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+                # epoch-level 共享 y_ran 采样
+                if getattr(args, 'use_epoch_shared_y_ran', False):
+                    should_update_prob = (
+                        epoch_prob is None
+                        or args.y_ran_prob_update_every == 1
+                        or (args.y_ran_prob_update_every > 1 and i % args.y_ran_prob_update_every == 0)
+                    )
+                    if should_update_prob:
+                        with torch.no_grad():
+                            epoch_prob, epoch_score = build_epoch_velocity_gradient_prob(
+                                train_loader=dataloader['train'],
+                                device=device,
+                                use_max_mix=args.y_ran_use_max_mix,
+                                mean_weight=args.y_ran_mean_weight,
+                                max_weight=args.y_ran_max_weight,
+                            )
+
+                    with torch.no_grad():
+                        y_shared = sample_shared_y_ran_from_epoch_prob(
+                            prob=epoch_prob,
+                            args=args,
+                            num_pts=args.y_ran_num_pts,
+                            structure_ratio=args.y_ran_structure_ratio,
+                            surface_ratio=args.y_ran_surface_ratio,
+                            uniform_ratio=args.y_ran_uniform_ratio,
+                            source_ratio=args.y_ran_source_ratio,
+                            surface_depth_grids=args.y_ran_surface_depth_grids,
+                        )
+                    y_ran = y_shared.unsqueeze(0).expand(
+                        vel_batch.shape[0], -1, -1
+                    ).clone().requires_grad_(True)
+                else:
+                    with torch.no_grad():
+                        y_ran = model.generate_structure_aware_y_ran(vel_batch, num_pts=900)
 
                 for batch in dataloader['train_y']:
                     y_batch = batch[0].to(device)
