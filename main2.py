@@ -22,6 +22,7 @@ def main():
     # 检查训练模式
     # ==========================================
     use_parallel = getattr(args, 'use_parallel', False)
+    use_staged = getattr(args, 'staged_training', False)
 
     if use_parallel:
         # 多 GPU 并行模式
@@ -43,9 +44,12 @@ def main():
             print(f"✅ 检测到 {len(available_gpus)} 个可用 GPU: {available_gpus[:num_gpus]}")
             print("=" * 60)
 
-            # 导入并调用分布式训练函数 (使用 mp.spawn 内部启动多进程)
-            from model.train_distributed import train_distributed
-            train_distributed(args)
+            if use_staged:
+                from model.train_distributed import train_distributed_staged
+                train_distributed_staged(args)
+            else:
+                from model.train_distributed import train_distributed
+                train_distributed(args)
             return
 
     # 单 GPU 模式
@@ -68,7 +72,6 @@ def main():
 
 
 if __name__ == "__main__":
-    torch.cuda.empty_cache()
     print('*******************************************')
     print('           START TRAINING Pi_DeepONet      ')
     print('*******************************************')
