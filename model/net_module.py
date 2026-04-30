@@ -25,17 +25,46 @@ class Sin(torch.nn.Module):
         return torch.sin(x)
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, embed_dim):
+    def __init__(self, embed_dim, max_scale=6.0):
         super().__init__()
         self.embed_dim = embed_dim
+        self.max_scale = max_scale
 
     def forward(self, x):
         embed = []
         for i in range(self.embed_dim):
-            embed.append(torch.sin(2**(i - self.embed_dim + 1) * 6 * np.pi * x))
-            embed.append(torch.cos(2**(i - self.embed_dim + 1) * 6 * np.pi * x))
+            scale = 2 ** (i - self.embed_dim + 1) * self.max_scale * np.pi
+            embed.append(torch.sin(scale * x))
+            embed.append(torch.cos(scale * x))
         return torch.cat(embed, dim=-1)
-        
+
+class WavenumberPE(nn.Module):
+    """
+    基于物理波数 k_ref = omega / c_ref 的位置编码。
+    freq 和 c_ref 由外部传入 (来自 freq_batch 和速度场数据)，支持多频场景。
+    设计为残差方式加入原始 PE，alpha 初始化为 0 等价原模型。
+    """
+    def __init__(self, embed_dim=4):
+        super().__init__()
+        self.embed_dim = embed_dim
+
+    def forward(self, y_phys, k_ref):
+        """
+        Args:
+            y_phys: 物理坐标 [B, N, 2], [z, x], 单位: 米
+            k_ref: 参考波数 [B, 1, 1], 由 freq_batch / vel_mean 动态计算
+        Returns:
+            [B, N, embed_dim * 4]
+        """
+        z_phase = k_ref * y_phys[:, :, 0:1]
+        x_phase = k_ref * y_phys[:, :, 1:2]
+        out = []
+        for i in range(self.embed_dim):
+            s = 2.0 ** i
+            out += [torch.sin(s * z_phase), torch.cos(s * z_phase),
+                    torch.sin(s * x_phase), torch.cos(s * x_phase)]
+        return torch.cat(out, dim=-1)
+
 class ResidualBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()

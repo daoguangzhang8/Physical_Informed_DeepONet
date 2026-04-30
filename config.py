@@ -4,7 +4,7 @@ class Args:
     # ==========================================
     load_path = '/home/sharedata/zdg'         # 数据集加载根目录
     weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
-    save_doc = 'output_all'                       # 结果输出文件夹名称
+    save_doc = 'output_stage'                       # 结果输出文件夹名称
     filename = 'PI_DeepONet_pde'              # 保存的模型前缀名称
 
     # 训练数据文件名
@@ -33,7 +33,7 @@ class Args:
     # 2. 硬件与设备配置 (Hardware & Device)
     # ==========================================
     device = 1                                # 单 GPU 模式: 指定使用的 GPU 设备编号
-    use_parallel = False                      # 是否启用多 GPU 并行训练 (True: 多GPU | False: 单GPU)
+    use_parallel = True                      # 是否启用多 GPU 并行训练 (True: 多GPU | False: 单GPU)
     num_gpus = 2                              # 使用的 GPU 数量
     min_gpu_memory = 23 * 1024                # GPU 最小可用内存 (MB)，低于此值的 GPU 不会被使用
 
@@ -56,7 +56,7 @@ class Args:
     # ==========================================
     # 4. 数据集与采样 (Dataset & Sampling)
     # ==========================================
-    nvel_train = 1                           # 训练所用的速度模型数量
+    nvel_train = 1500                           # 训练所用的速度模型数量
     source_list = [0]                         # [0, 1, 2, 3, 4] 训练数据中包含的震源编号列表 (0-4 共5个震源)
 
     # 空间点采样模式
@@ -64,8 +64,8 @@ class Args:
     halton_sample_ratio = 0.5                   # Halton 采样比例（仅在 sampling_mode='halton' 时生效，如 0.2 表示采样 20% 的网格点）
 
     # 批处理配置
-    batch_size = 800                          # Trunk Net 坐标采样批次大小 (num_sample)
-    batch_size_v = 1                          # Branch Net 速度场/背景场批次大小 (Batch_v)
+    batch_size = 1000                          # Trunk Net 坐标采样批次大小 (num_sample)
+    batch_size_v = 35                          # Branch Net 速度场/背景场批次大小 (Batch_v)
     ny_train = int(nz * nx * halton_sample_ratio)  # 训练集空间采样点总数 (由网格尺寸和采样比例自动计算)
     accumulation_steps = 4                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
 
@@ -77,7 +77,7 @@ class Args:
     # ==========================================
     # 5. 训练超参数 (Training Hyperparameters)
     # ==========================================
-    NIter = 3000 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
+    NIter = 6000 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
     lr = 1 * 1e-4                             # 初始基础学习率
     weight_decay = 1e-4                       # 优化器权重衰减 (L2 正则化)系数
 
@@ -146,7 +146,7 @@ class Args:
     # ==========================================
     # 12. 三阶段渐进训练 (Staged Curriculum Training)
     # ==========================================
-    staged_training = False                    # 总开关，False 则使用原始单阶段训练
+    staged_training = True                   # 总开关，False 则使用原始单阶段训练
 
     # 每阶段使用独立数据集，文件名通过 freq_range 替换基础文件名中的 'freq3to20' 得到
     # 例如基础文件名含 'freq3to20' → Stage 0 替换为 'freq3to11'
@@ -155,37 +155,48 @@ class Args:
             'name': 'low_freq',
             'freq_range': '3to11',               # 替换基础文件名中的 'freq3to20'
             'freq_min': 3.0, 'freq_max': 11.0,   # 信息标签，用于日志打印
-            'NIter': 3500,
+            'NIter': 1001,
             'lr': 1e-4,                           # 从头训练，完整 LR
             'warmup_epochs': 100,
             'a': 1, 'b': 1, 'c': 0,
+            'replay_stages': [],
+            'replay_ratio': 0.2,                  # replay 数据保留比例 (1.0=全部, 0.5=随机抽取50%)
+            'data_dir': '/home/sharedata/zdg/multifreq_selected/freq_3to11',
         },
         {
             'name': 'mid_freq',
             'freq_range': '12to18',
             'freq_min': 12.0, 'freq_max': 18.0,
-            'NIter': 3500,
+            'NIter': 1001,
             'lr': 5e-5,                           # 课程学习，适度降低
             'warmup_epochs': 50,
             'a': 1, 'b': 1, 'c': 0,
+            'replay_stages': [0],
+            'replay_ratio': 0.2,
+            'data_dir': '/home/sharedata/zdg/multifreq_selected/freq_12to18',
         },
         {
             'name': 'high_freq',
             'freq_range': '18to25',
             'freq_min': 18.0, 'freq_max': 25.0,
-            'NIter': 3500,
+            'NIter': 1001,
             'lr': 2e-5,                           # 高频更难，进一步降低
             'warmup_epochs': 50,
             'a': 1, 'b': 1, 'c': 0,
+            'replay_stages': [0, 1],
+            'replay_ratio': 0.2,
+            'data_dir': '/home/sharedata/zdg/multifreq_selected/freq_18to25',
         },
     ]
 
     # ==========================================
     # 13. y_ran Epoch-Level 共享采样 (Epoch Shared Sampling)
     # ==========================================
+    use_y_ran = True                          # False: 不使用自由点 | True: 使用 y_ran 自由点参与 PDE 计算
+
     use_epoch_shared_y_ran = True              # True: 使用 epoch 级共享采样 | False: 使用原始 per-model 采样
 
-    y_ran_num_pts = 900                        # y_ran 采样点总数
+    y_ran_num_pts = 500                        # y_ran 采样点总数
     y_ran_structure_ratio = 0.60               # epoch-structure 采样点比例
     y_ran_surface_ratio = 0.20                 # 表层采样点比例
     y_ran_uniform_ratio = 0.20                 # 均匀采样点比例
@@ -197,4 +208,4 @@ class Args:
     y_ran_max_weight = 0.3                     # mean+max 混合时的 max 权重
 
     # 概率图更新频率: 1=每epoch, >1=每N个epoch, 0=只计算一次并缓存
-    y_ran_prob_update_every = 1
+    y_ran_prob_update_every = 0

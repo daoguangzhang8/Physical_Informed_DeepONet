@@ -25,7 +25,9 @@ class Pi_DeepONet(nn.Module):
         self.b2 = args.batch_size
         
         # --- 编码器与特征提取 ---
-        self.pos_encoder = PositionalEncoding(embed_dim=4)
+        self.pos_encoder = PositionalEncoding(embed_dim=4, max_scale=args.pe_max_scale)
+        self.kpe = WavenumberPE(embed_dim=4)
+        self.kpe_alpha = nn.Parameter(torch.tensor(0.0))  # 初始化为 0，训练开始等价原模型
         # self.fencoder = FourierFeatureEncoder(input_dim=2, mapping_size=self.feat_dim)  # 未使用，已注释
 
         # --- 网络分支 (Branch) ---
@@ -43,7 +45,7 @@ class Pi_DeepONet(nn.Module):
         self.combinedlayer2 = GaussianWeightedLayer(self.feat_dim, dh=args.dh)
         self.attengate = AttenGate(use_softmax=True)
 
-        self.smooth_feature_encoder = SmoothBlockEncoder(self.feat_dim, self.feat_dim, grid_size=20)
+        self.smooth_feature_encoder = SmoothBlockEncoder(self.feat_dim, self.feat_dim, grid_size=40)
 
         # --- 主干网络 (Trunk) 与输出层 ---
         self.trunk = FiLMTrunk(input_dim=16, width=self.feat_dim)
@@ -77,26 +79,44 @@ class Pi_DeepONet(nn.Module):
                 if m.out_proj.bias is not None:
                     nn.init.zeros_(m.out_proj.bias)
 
-    def forward(self, vel, y, UU0):
+    def forward(self, vel, y, UU0, freq_batch=None):
         """
         前向传播
         Args:
             vel: 速度场模型 [B_v, C, Z, X]
             y: 查询坐标点 [B_v, B_pts, 2]
             UU0: 背景波场 [B_v, 2, Z, X]
+            freq_batch: 每个样本的频率 [B_v] (Hz), 来自数据文件
         Returns:
             outputs: 预测波场残差 (实部和虚部) [B_v, B_pts, 2]
         """
-        x_dim = vel.shape[-1]
-        
         # --- 1. 坐标预处理与 Trunk 特征提取 (Query) ---
-        y_normalized = 2 * (y - 0) / (self.args.dh * x_dim - 0) - 1
-        z_normalized = y_normalized[:, :, 0].unsqueeze(-1)
-        x_normalized = y_normalized[:, :, 1].unsqueeze(-1)
-        
+        Z_dim = vel.shape[-2]
+        X_dim = vel.shape[-1]
+
+        z_normalized = 2 * y[:, :, 0:1] / (self.args.dh * (Z_dim - 1)) - 1
+        x_normalized = 2 * y[:, :, 1:2] / (self.args.dh * (X_dim - 1)) - 1
+        y_normalized = torch.cat([z_normalized, x_normalized], dim=2)  # [B_v, B_pts, 2]
+
         z_encoded = self.pos_encoder(z_normalized)
         x_encoded = self.pos_encoder(x_normalized)
         y_encoded = torch.cat([z_encoded, x_encoded], dim=2)  # [B_v, B_pts, 16]
+
+        # 残差波数 PE: freq 来自 freq_batch, c_ref 来自速度场均值
+        if self.kpe_alpha.item() != 0.0 or self.training:
+            if freq_batch is None:
+                freq_batch = torch.full((vel.shape[0],), self.args.default_freq, device=vel.device)
+            c_ref = vel.mean(dim=[2, 3]).squeeze(1)  # [B_v], 每个样本的平均速度
+            omega = 2 * np.pi * freq_batch * 1e-3  # [B_v]
+            k_ref = (omega / c_ref).unsqueeze(-1).unsqueeze(-1)  # [B_v, 1, 1]
+            k_encoded = self.kpe(y, k_ref)  # [B_v, B_pts, embed_dim*4]
+            alpha = 0.1 * torch.tanh(self.kpe_alpha)
+            if not hasattr(self, '_kpe_shape_logged'):
+                print(f"[DEBUG] kpe shapes — y: {y.shape}, k_ref: {k_ref.shape}, "
+                      f"y_encoded: {y_encoded.shape}, k_encoded: {k_encoded.shape}, alpha: {alpha.shape}")
+                self._kpe_shape_logged = True
+            k_dim = y_encoded.shape[-1]
+            y_encoded = y_encoded + alpha * k_encoded[:, :, :k_dim]
         
         # --- 2. Branch 特征提取与 Tokenization (Memory/Key-Value) ---
         B1_raw = self.branch1(vel)
@@ -118,9 +138,9 @@ class Pi_DeepONet(nn.Module):
         
         return outputs
                         
-    def loss_BC(self, vel, y, UU0, labels):
+    def loss_BC(self, vel, y, UU0, labels, freq_batch=None):
         """计算数据拟合损失 (Data/BC Loss)"""
-        pred = self.forward(vel, y, UU0)
+        pred = self.forward(vel, y, UU0, freq_batch=freq_batch)
         loss_u = self.loss_function(pred, labels)
         return loss_u
 
@@ -142,7 +162,7 @@ class Pi_DeepONet(nn.Module):
             freq_batch: 每个样本对应的频率值 [B_v]。若为 None 则使用默认值 5 Hz。
         """
         y.requires_grad_(True)
-        Delta_U = self.forward(vel, y, UU0)
+        Delta_U = self.forward(vel, y, UU0, freq_batch=freq_batch)
         return self._compute_pde_residual(vel, y, UU0, Delta_U, freq_batch=freq_batch)
 
     def _compute_pde_residual(self, vel, y, UU0, Delta_U, freq_batch=None):
@@ -192,7 +212,7 @@ class Pi_DeepONet(nn.Module):
         k = (1 / c) ** 2
         k0 = (1 / c0) ** 2
 
-        Q = 15
+        Q = 75
         alpha = 1 / Q
         rhot = (1 - alpha / torch.pi * torch.log(f / 50) - 1j * alpha / 2) ** 2
 
@@ -265,7 +285,7 @@ class Pi_DeepONet(nn.Module):
 
         return torch.mean(residual_real ** 2 + residual_imag ** 2)
     
-    def loss_Reg(self, vel, y, UU0, source_coord):
+    def loss_Reg(self, vel, y, UU0, source_coord, freq_batch=None):
         """震源区域正则化损失"""
         z_coord, x_coord = y[:, 0], y[:, 1]
         source_z, source_x = source_coord[:, 0], source_coord[:, 1]
@@ -273,16 +293,16 @@ class Pi_DeepONet(nn.Module):
         inside_distance = 100 - torch.sqrt((z_coord - source_z) ** 2 + (x_coord - source_x) ** 2)
         coe = F.relu(inside_distance) / (inside_distance + 1e-15)
 
-        pred = self.forward(vel, y, UU0)
+        pred = self.forward(vel, y, UU0, freq_batch=freq_batch)
         N_reg = torch.clamp(torch.count_nonzero(coe), min=1.0).to(vel.device)
 
         return torch.sum(coe * (pred[:, 0] ** 2 + pred[:, 1] ** 2)) / N_reg
 
-    def loss_op(self, model0, vel, y, UU0):
+    def loss_op(self, model0, vel, y, UU0, freq_batch=None):
         """模型间操作损失 (如知识蒸馏或微调约束)"""
         with torch.no_grad():
-            pred0 = model0(vel, y, UU0)
-        pred_ft = self.forward(vel, y, UU0)
+            pred0 = model0(vel, y, UU0, freq_batch=freq_batch)
+        pred_ft = self.forward(vel, y, UU0, freq_batch=freq_batch)
         return torch.sum((pred0 - pred_ft) ** 2)
         
     def get_ortho_loss(self, T, weight):
@@ -394,9 +414,9 @@ class Pi_DeepONet(nn.Module):
         y_ran = torch.stack(y_ran_list, dim=0)
         return y_ran.requires_grad_(True)
 
-    def envelope_barrier_loss(self, vel, y, UU0, u_fno, lambda_env=1.0):
+    def envelope_barrier_loss(self, vel, y, UU0, u_fno, lambda_env=1.0, freq_batch=None):
         """计算波场包络的流形屏障惩罚损失，消除高频相位错位的影响"""
-        u_pred = self.forward(vel, y, UU0)
+        u_pred = self.forward(vel, y, UU0, freq_batch=freq_batch)
         
         env_pred = torch.sqrt(u_pred[..., 0]**2 + u_pred[..., 1]**2 + 1e-8)
         env_fno = torch.sqrt(u_fno[..., 0]**2 + u_fno[..., 1]**2 + 1e-8)
@@ -405,12 +425,14 @@ class Pi_DeepONet(nn.Module):
         return torch.mean(loss_env)
 
         
-    def loss(self, vel, y, UU0, labels, a, b, c, data_norm_coe=1., pde_norm_coe=1., freq_batch=None, y_ran=None):
+    def loss(self, vel, y, UU0, labels, a, b, c, d=0., data_norm_coe=1., pde_norm_coe=1., env_norm_coe=1., freq_batch=None, y_ran=None):
         """
         核心损失函数计算接口。
-        优化：只做一次 forward pass，同时服务于 BC loss 和 PDE loss。
+        优化：只做一次 forward pass，同时服务于 BC loss、PDE loss 和 Envelope loss。
 
         Args:
+            d: envelope loss 权重
+            env_norm_coe: envelope loss 归一化系数
             freq_batch: 每个样本对应的频率值 [B_v]。若为 None 则使用默认值。
             y_ran: 预计算的自适应采样点 [B_v, N_ran, 2]。若提供则拼接到 y 后；若为 None 则不生成。
         """
@@ -432,25 +454,30 @@ class Pi_DeepONet(nn.Module):
 
         y_combined.requires_grad_(True)
 
-        # 3. 只做一次 forward pass (服务于 BC loss 和 PDE loss)
-        Delta_U = self.forward(vel, y_combined, UU0)
+        # 3. 只做一次 forward pass (服务于 BC loss、PDE loss 和 Envelope loss)
+        Delta_U = self.forward(vel, y_combined, UU0, freq_batch=freq_batch)
 
         # 4. BC loss: 使用前 n_y 个点的预测
         pred_y = Delta_U[:, :n_y, :]
         loss_u = self.loss_function(pred_y, labels) / data_norm_coe
 
-        # 5. PDE loss: 使用完整输出计算物理残差
+        # 5. Envelope loss: 仅在标签点上计算
+        env_pred = torch.sqrt(pred_y[..., 0]**2 + pred_y[..., 1]**2 + 1e-8)
+        env_label = torch.sqrt(labels[..., 0]**2 + labels[..., 1]**2 + 1e-8)
+        loss_env = self.loss_function(env_pred, env_label) / env_norm_coe
+
+        # 6. PDE loss: 使用完整输出计算物理残差
         loss_f_combined = self._compute_pde_residual(vel, y_combined, UU0, Delta_U, freq_batch=freq_batch) / pde_norm_coe
 
         loss_r = 0.0  # 占位
 
-        # 6. 根据权重加权求和
-        loss_val = (a * loss_u) + b * loss_f_combined
+        # 7. 根据权重加权求和
+        loss_val = a * loss_u + b * loss_f_combined + d * loss_env
 
-        return loss_val, loss_f_combined, loss_u, loss_r
+        return loss_val, loss_f_combined, loss_u, loss_r, loss_env
 
     def compute_loss(self, Delta_U, vel, y, UU0, labels, y_combined,
-                     a, b, c, data_norm_coe=1., pde_norm_coe=1., freq_batch=None):
+                     a, b, c, d=0., data_norm_coe=1., pde_norm_coe=1., env_norm_coe=1., freq_batch=None):
         """
         在 DDP forward 之后计算损失 (不包含 forward 调用)。
         供 DDP 训练使用：先通过 DDP wrapper 调用 forward()，再调用此方法计算 loss。
@@ -462,12 +489,13 @@ class Pi_DeepONet(nn.Module):
             UU0: 背景波场 [B_v, 2, Z, X]
             labels: 标签波场 [B_v, 2, Z, X]
             y_combined: 拼接后的坐标 [B_v, B_data_pts + B_ran_pts, 2]，requires_grad=True
-            a, b, c: 损失权重
+            a, b, c, d: 损失权重
             data_norm_coe: 数据损失归一化系数
             pde_norm_coe: PDE 损失归一化系数
+            env_norm_coe: envelope 损失归一化系数
             freq_batch: 频率值 [B_v]
         Returns:
-            (total_loss, loss_f, loss_u, loss_r) — 与 loss() 返回格式一致
+            (total_loss, loss_f, loss_u, loss_r, loss_env)
         """
         batch_size_v = vel.shape[0]
         nz, nx = vel.shape[2], vel.shape[3]
@@ -483,12 +511,17 @@ class Pi_DeepONet(nn.Module):
         pred_y = Delta_U[:, :n_y, :]
         loss_u = self.loss_function(pred_y, labels_extracted) / data_norm_coe
 
-        # 3. PDE 物理残差损失
+        # 3. Envelope loss
+        env_pred = torch.sqrt(pred_y[..., 0]**2 + pred_y[..., 1]**2 + 1e-8)
+        env_label = torch.sqrt(labels_extracted[..., 0]**2 + labels_extracted[..., 1]**2 + 1e-8)
+        loss_env = self.loss_function(env_pred, env_label) / env_norm_coe
+
+        # 4. PDE 物理残差损失
         loss_f = self._compute_pde_residual(vel, y_combined, UU0, Delta_U, freq_batch=freq_batch) / pde_norm_coe
 
         loss_r = 0.0
 
-        # 4. 加权求和
-        loss_val = (a * loss_u) + b * loss_f
+        # 5. 加权求和
+        loss_val = a * loss_u + b * loss_f + d * loss_env
 
-        return loss_val, loss_f, loss_u, loss_r
+        return loss_val, loss_f, loss_u, loss_r, loss_env

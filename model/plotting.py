@@ -2,7 +2,7 @@ from config import *
 from Labconfig import *
 from model.utils import *
 
-def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
+def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred, freq=None):
     # 使用 pml_active 作为画图时的裁切力度（训练数据保留了 pml_active 个 PML 网格）
     L = args.pml_active
     L1 = args.pml_active * times
@@ -40,13 +40,13 @@ def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
     dataloader_test = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=False)
 
     model.eval()
+    freq_batch_plot = freq.to(device) if freq is not None else None
     u_test = []
     with torch.no_grad():
         for batch in dataloader_test:
             y_pred_batch = batch[0].to(device)
             y_batch = y_pred_batch.unsqueeze(0)
-            # print('y', y_batch.shape)
-            u_pred_batch = model(vel_pred.to(device), y_batch, UU0_pred.to(device)).squeeze(0)
+            u_pred_batch = model(vel_pred.to(device), y_batch, UU0_pred.to(device), freq_batch=freq_batch_plot).squeeze(0)
             u_test.append(u_pred_batch.detach().cpu().numpy())
 
     # 保存测试结果（修复：使用实际计算出的 Nz, Nx）
@@ -111,7 +111,7 @@ def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred):
 
 
 
-def plot_loss(epoch, save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss):
+def plot_loss(epoch, save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss, suffix=''):
     """
     绘制并保存训练和验证的损失曲线
     """
@@ -132,7 +132,7 @@ def plot_loss(epoch, save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_lo
     plt.yscale('log')
     plt.legend()
     plt.title(f'epoch {epoch} Data Loss')
-    plt.savefig(f"{save_doc}/Dataloss_curve.png")
+    plt.savefig(f"{save_doc}/Dataloss_curve{suffix}.png")
     plt.close()
 
     # 2. 绘制 PDE Loss 曲线
@@ -142,7 +142,7 @@ def plot_loss(epoch, save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_lo
     plt.yscale('log')
     plt.legend()
     plt.title(f'epoch {epoch} PDE Loss')
-    plt.savefig(f"{save_doc}/PDEloss_curve.png")
+    plt.savefig(f"{save_doc}/PDEloss_curve{suffix}.png")
     plt.close()
 
     # 3. 绘制 Total Loss 曲线
@@ -151,7 +151,7 @@ def plot_loss(epoch, save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_lo
     plt.yscale('log')
     plt.legend()
     plt.title(f'epoch {epoch} Total Loss')
-    plt.savefig(f"{save_doc}/loss_curve.png")
+    plt.savefig(f"{save_doc}/loss_curve{suffix}.png")
     plt.close()
 
 
@@ -161,17 +161,15 @@ def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_
         model = fine_tuning(args, model, fno, dataloader_y, vel, UU0, labels, freq=freq)
     model.eval()
     device = args.device
-    # 使用 pml_active 作为画图时的裁切力度（训练数据保留了 pml_active 个 PML 网格）
     L = args.pml_active
-    # filename = args.filename
+    freq_batch_plot = freq.to(device) if freq is not None else None
     u_pred = []
 
     with torch.no_grad():
         for batch in dataloader_y:
             y_batch = batch[0].to(device)
             y_batch = y_batch.unsqueeze(0)
-            # 单卡直接调用model（无需.module）
-            u_batch = model(vel.to(device), y_batch, UU0.to(device)).squeeze(0)
+            u_batch = model(vel.to(device), y_batch, UU0.to(device), freq_batch=freq_batch_plot).squeeze(0)
             u_pred.append(u_batch.detach().cpu().numpy())
 
     # 处理预测结果（修复：使用实际数据尺寸而非配置参数）
@@ -323,11 +321,11 @@ def fine_tuning(args, model0, fno, dataloader_y, vel, UU0, labels, freq=None):
             
             # 计算损失
             freq_dev = freq.to(device) if freq is not None else None
-            loss, loss_f, loss_u, loss_r = model_ft.loss(
+            loss, loss_f, loss_u, loss_r, _ = model_ft.loss(
                 vel.to(device), y_batch, UU0.to(device), labels.to(device),
-                a, b, c, data_norm_coe, pde_norm_coe, freq_batch=freq_dev
+                a, b, c, 0., data_norm_coe, pde_norm_coe, 1., freq_batch=freq_dev
             )
-            loss_op = c * model_ft.loss_op(model0, vel.to(device), y_batch, UU0.to(device))
+            loss_op = c * model_ft.loss_op(model0, vel.to(device), y_batch, UU0.to(device), freq_batch=freq_dev)
             loss = loss + loss_op
             
             # 修复：将除以累加步数后的结果重新赋值给 loss，否则梯度会按原比例回传

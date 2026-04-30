@@ -180,6 +180,36 @@ def _train_worker(rank, world_size, args):
         coord_batches = list(dataloader['train_y'])
         n_coord = len(coord_batches)
 
+        # y_ran: 每 epoch 生成一次（epoch shared 路径）
+        y_ran_epoch_shared = None
+        if getattr(args, 'use_y_ran', False) and getattr(args, 'use_epoch_shared_y_ran', False):
+            should_update_prob = (
+                epoch_prob is None
+                or args.y_ran_prob_update_every == 1
+                or (args.y_ran_prob_update_every > 1 and i % args.y_ran_prob_update_every == 0)
+            )
+            if should_update_prob:
+                with torch.no_grad():
+                    epoch_prob, epoch_score = build_epoch_velocity_gradient_prob(
+                        train_loader=dataloader['train'],
+                        device=device,
+                        use_max_mix=args.y_ran_use_max_mix,
+                        mean_weight=args.y_ran_mean_weight,
+                        max_weight=args.y_ran_max_weight,
+                    )
+
+            with torch.no_grad():
+                y_ran_epoch_shared = sample_shared_y_ran_from_epoch_prob(
+                    prob=epoch_prob,
+                    args=args,
+                    num_pts=args.y_ran_num_pts,
+                    structure_ratio=args.y_ran_structure_ratio,
+                    surface_ratio=args.y_ran_surface_ratio,
+                    uniform_ratio=args.y_ran_uniform_ratio,
+                    source_ratio=args.y_ran_source_ratio,
+                    surface_depth_grids=args.y_ran_surface_depth_grids,
+                )
+
         # 遍历训练数据
         for batch_data in dataloader['train']:
             if has_freq:
@@ -196,47 +226,23 @@ def _train_worker(rank, world_size, args):
             else:
                 labels_batch = labels_batch.to(device)
 
-            # 每个 velocity batch 生成一组共享 y_ran
-            if getattr(args, 'use_epoch_shared_y_ran', False):
-                should_update_prob = (
-                    epoch_prob is None
-                    or args.y_ran_prob_update_every == 1
-                    or (args.y_ran_prob_update_every > 1 and i % args.y_ran_prob_update_every == 0)
-                )
-                if should_update_prob:
-                    with torch.no_grad():
-                        epoch_prob, epoch_score = build_epoch_velocity_gradient_prob(
-                            train_loader=dataloader['train'],
-                            device=device,
-                            use_max_mix=args.y_ran_use_max_mix,
-                            mean_weight=args.y_ran_mean_weight,
-                            max_weight=args.y_ran_max_weight,
-                        )
-
-                with torch.no_grad():
-                    y_shared = sample_shared_y_ran_from_epoch_prob(
-                        prob=epoch_prob,
-                        args=args,
-                        num_pts=args.y_ran_num_pts,
-                        structure_ratio=args.y_ran_structure_ratio,
-                        surface_ratio=args.y_ran_surface_ratio,
-                        uniform_ratio=args.y_ran_uniform_ratio,
-                        source_ratio=args.y_ran_source_ratio,
-                        surface_depth_grids=args.y_ran_surface_depth_grids,
-                    )
-                y_ran = y_shared.unsqueeze(0).expand(
+            # y_ran: 使用 epoch 预生成或 per-model 生成
+            if y_ran_epoch_shared is not None:
+                y_ran = y_ran_epoch_shared.unsqueeze(0).expand(
                     vel_batch.shape[0], -1, -1
                 ).clone().requires_grad_(True)
-            else:
+            elif getattr(args, 'use_y_ran', False):
                 with torch.no_grad():
                     y_ran = model.module.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+            else:
+                y_ran = None
 
             for idx, batch in enumerate(coord_batches):
                 y_batch = batch[0].to(device)
                 y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
 
                 # 拼接数据坐标和 PDE 采样坐标
-                y_combined = torch.cat([y_batch, y_ran], dim=1)
+                y_combined = torch.cat([y_batch, y_ran], dim=1) if y_ran is not None else y_batch
                 y_combined.requires_grad_(True)
 
                 # 通过 DDP wrapper 调用 forward (触发梯度同步 hook)
@@ -480,6 +486,35 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
         coord_batches = list(dataloader['train_y'])
         n_coord = len(coord_batches)
 
+        # y_ran: 每 epoch 生成一次（epoch shared 路径）
+        y_ran_epoch_shared = None
+        if getattr(args, 'use_y_ran', False) and getattr(args, 'use_epoch_shared_y_ran', False):
+            should_update_prob = (
+                epoch_prob is None
+                or args.y_ran_prob_update_every == 1
+                or (args.y_ran_prob_update_every > 1 and i % args.y_ran_prob_update_every == 0)
+            )
+            if should_update_prob:
+                with torch.no_grad():
+                    epoch_prob, epoch_score = build_epoch_velocity_gradient_prob(
+                        train_loader=dataloader['train'],
+                        device=device,
+                        use_max_mix=args.y_ran_use_max_mix,
+                        mean_weight=args.y_ran_mean_weight,
+                        max_weight=args.y_ran_max_weight,
+                    )
+
+            with torch.no_grad():
+                y_ran_epoch_shared = sample_shared_y_ran_from_epoch_prob(
+                    prob=epoch_prob, args=args,
+                    num_pts=args.y_ran_num_pts,
+                    structure_ratio=args.y_ran_structure_ratio,
+                    surface_ratio=args.y_ran_surface_ratio,
+                    uniform_ratio=args.y_ran_uniform_ratio,
+                    source_ratio=args.y_ran_source_ratio,
+                    surface_depth_grids=args.y_ran_surface_depth_grids,
+                )
+
         for batch_data in dataloader['train']:
             if has_freq:
                 vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
@@ -495,43 +530,22 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
             else:
                 labels_batch = labels_batch.to(device)
 
-            # epoch-level 共享 y_ran
-            if getattr(args, 'use_epoch_shared_y_ran', False):
-                should_update_prob = (
-                    epoch_prob is None
-                    or args.y_ran_prob_update_every == 1
-                    or (args.y_ran_prob_update_every > 1 and i % args.y_ran_prob_update_every == 0)
-                )
-                if should_update_prob:
-                    with torch.no_grad():
-                        epoch_prob, epoch_score = build_epoch_velocity_gradient_prob(
-                            train_loader=dataloader['train'],
-                            device=device,
-                            use_max_mix=args.y_ran_use_max_mix,
-                            mean_weight=args.y_ran_mean_weight,
-                            max_weight=args.y_ran_max_weight,
-                        )
-
-                with torch.no_grad():
-                    y_shared = sample_shared_y_ran_from_epoch_prob(
-                        prob=epoch_prob, args=args,
-                        num_pts=args.y_ran_num_pts,
-                        structure_ratio=args.y_ran_structure_ratio,
-                        surface_ratio=args.y_ran_surface_ratio,
-                        uniform_ratio=args.y_ran_uniform_ratio,
-                        source_ratio=args.y_ran_source_ratio,
-                        surface_depth_grids=args.y_ran_surface_depth_grids,
-                    )
-                y_ran = y_shared.unsqueeze(0).expand(vel_batch.shape[0], -1, -1).clone().requires_grad_(True)
-            else:
+            # y_ran: 使用 epoch 预生成或 per-model 生成
+            if y_ran_epoch_shared is not None:
+                y_ran = y_ran_epoch_shared.unsqueeze(0).expand(
+                    vel_batch.shape[0], -1, -1
+                ).clone().requires_grad_(True)
+            elif getattr(args, 'use_y_ran', False):
                 with torch.no_grad():
                     y_ran = model.module.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+            else:
+                y_ran = None
 
             for idx, batch in enumerate(coord_batches):
                 y_batch = batch[0].to(device)
                 y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
 
-                y_combined = torch.cat([y_batch, y_ran], dim=1)
+                y_combined = torch.cat([y_batch, y_ran], dim=1) if y_ran is not None else y_batch
                 y_combined.requires_grad_(True)
 
                 Delta_U = model(vel_batch, y_combined, UU0_batch, freq_batch=freq_batch)

@@ -1,5 +1,4 @@
 import os
-import gc
 import numpy as np
 import torch
 import torch.nn as nn
@@ -381,16 +380,16 @@ def plot_single_velocity_multi_sources(args, model, vel, UU0_list, labels_list, 
     print(f"模型预测性能指标汇总：{filename_prefix}")
     print("="*60)
     
+    freq_batch_eval = freq.to(device) if freq is not None else None
     with torch.no_grad():
         for s_idx in range(num_sources):
             curr_UU0 = UU0_list[s_idx].unsqueeze(0) if UU0_list[s_idx].dim() == 3 else UU0_list[s_idx]
             curr_label = labels_list[s_idx]
-            
+
             u_pred_list = []
             for batch in dataloader_y:
                 y_batch = batch[0].to(device).unsqueeze(0)
-                # 使用 eval_model (微调后的 或 原版的)
-                u_batch = eval_model(vel, y_batch, curr_UU0)
+                u_batch = eval_model(vel, y_batch, curr_UU0, freq_batch=freq_batch_eval)
                 u_pred_list.append(u_batch)
                 
             pred_concat = torch.cat(u_pred_list, dim=1)
@@ -652,9 +651,6 @@ def test(args, custom_weights_path=None):
     except Exception as e:
         print(f"测试过程发生错误: {e}")
         raise
-    finally:
-        torch.cuda.empty_cache()
-        gc.collect()
 def main():
     args = Args_test()
     if torch.cuda.is_available():
@@ -669,7 +665,6 @@ def main():
     test(args) 
 
 if __name__ == "__main__":
-    torch.cuda.empty_cache() 
     print('*******************************************')
     print('           START EVALUATION                ')
     print('*******************************************')

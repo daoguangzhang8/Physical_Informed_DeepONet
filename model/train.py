@@ -1,5 +1,4 @@
 import os
-import gc
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -40,9 +39,21 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
     args.vel_filename = base_vel_filename.replace(base_freq_tag, stage_freq_tag)
     args.backgroundfield_filename = base_bg_filename.replace(base_freq_tag, stage_freq_tag)
     args.wavefield_filename = base_wf_filename.replace(base_freq_tag, stage_freq_tag)
-    args.freq_filename = base_freq_filename.replace('freq_used', f'freq{freq_range}_used')
+    args.freq_filename = base_freq_filename  # freq 文件不含 stage 标签，保持原文件名
+
+    # 如果 stage 配置了 data_dir，覆盖 load_path（课程学习独立数据路径）
+    original_load_path = args.load_path
+    if 'data_dir' in stage_config:
+        args.load_path = stage_config['data_dir']
+        # data_dir 直接指向数据文件所在目录，文件名不需要子目录前缀
+        args.vel_filename = os.path.basename(args.vel_filename)
+        args.backgroundfield_filename = os.path.basename(args.backgroundfield_filename)
+        args.wavefield_filename = os.path.basename(args.wavefield_filename)
+        args.freq_filename = os.path.basename(args.freq_filename)
+    current_stage_load_path = args.load_path
 
     print(f'\n[*] Stage {stage_idx} [{stage_name}] 数据文件:')
+    print(f'    load_path: {args.load_path}')
     print(f'    vel:   {args.vel_filename}')
     print(f'    bg:    {args.backgroundfield_filename}')
     print(f'    wf:    {args.wavefield_filename}')
@@ -64,6 +75,95 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
 
     # ---- 3. 加载数据 ----
     dataloader, plot_data = prepare_training_dataloaders(args, device)
+
+    # ---- 3.5 Replay 前序阶段数据（防遗忘） ----
+    replay_stages_list = stage_config.get('replay_stages', [])
+    if replay_stages_list and stage_idx > 0:
+        # 保存当前阶段的文件名（replay 后需恢复）
+        cur_vel_fn = args.vel_filename
+        cur_bg_fn = args.backgroundfield_filename
+        cur_wf_fn = args.wavefield_filename
+        cur_freq_fn = args.freq_filename
+
+        # 从当前 DataLoader 提取训练集 Tensor
+        train_ds = dataloader['train'].dataset
+        train_tensors = train_ds.tensors
+        has_freq_replay = len(train_tensors) >= 4
+        if has_freq_replay:
+            combined_vel = train_tensors[0]
+            combined_UU0 = train_tensors[1]
+            combined_labels = train_tensors[2]
+            combined_freq = train_tensors[3]
+        else:
+            combined_vel = train_tensors[0]
+            combined_UU0 = train_tensors[1]
+            combined_labels = train_tensors[2]
+            combined_freq = None
+
+        for replay_idx in replay_stages_list:
+            replay_config = args.stages[replay_idx]
+            replay_freq_tag = f'freq{replay_config["freq_range"]}'
+
+            # 替换文件名为 replay 阶段
+            args.vel_filename = base_vel_filename.replace(base_freq_tag, replay_freq_tag)
+            args.backgroundfield_filename = base_bg_filename.replace(base_freq_tag, replay_freq_tag)
+            args.wavefield_filename = base_wf_filename.replace(base_freq_tag, replay_freq_tag)
+            args.freq_filename = base_freq_filename  # freq 文件不含 stage 标签，保持原文件名
+
+            # 使用 replay 阶段的 data_dir
+            if 'data_dir' in replay_config:
+                args.load_path = replay_config['data_dir']
+                args.vel_filename = os.path.basename(args.vel_filename)
+                args.backgroundfield_filename = os.path.basename(args.backgroundfield_filename)
+                args.wavefield_filename = os.path.basename(args.wavefield_filename)
+                args.freq_filename = os.path.basename(args.freq_filename)
+
+            print(f'    [Replay] 加载 Stage {replay_idx} [{replay_config["name"]}] 数据: {args.load_path}/{args.vel_filename}')
+
+            replay_dl, _ = prepare_training_dataloaders(args, device)
+            replay_ds = replay_dl['train'].dataset
+            replay_tensors = replay_ds.tensors
+
+            # 按 replay_ratio 随机采样子集
+            replay_ratio = replay_config.get('replay_ratio', 1.0)
+            n_replay = replay_tensors[0].shape[0]
+            if replay_ratio < 1.0:
+                n_sample = max(1, int(n_replay * replay_ratio))
+                perm = torch.randperm(n_replay)[:n_sample]
+                replay_tensors = tuple(t[perm] for t in replay_tensors)
+                print(f'    [Replay] Stage {replay_idx}: {n_sample}/{n_replay} 样本 (ratio={replay_ratio})')
+
+            combined_vel = torch.cat([combined_vel, replay_tensors[0]], dim=0)
+            combined_UU0 = torch.cat([combined_UU0, replay_tensors[1]], dim=0)
+            combined_labels = torch.cat([combined_labels, replay_tensors[2]], dim=0)
+            if has_freq_replay and len(replay_tensors) >= 4:
+                combined_freq = torch.cat([combined_freq, replay_tensors[3]], dim=0)
+
+        # 恢复当前阶段的文件名和 load_path
+        args.vel_filename = cur_vel_fn
+        args.backgroundfield_filename = cur_bg_fn
+        args.wavefield_filename = cur_wf_fn
+        args.freq_filename = cur_freq_fn
+        args.load_path = current_stage_load_path
+        
+
+        # 重建训练 DataLoader
+        pin_mem = device.type == 'cuda'
+        num_workers = 4
+        prefetch_factor = 2
+
+        if has_freq_replay:
+            new_train_ds = TensorDataset(combined_vel, combined_UU0, combined_labels, combined_freq)
+        else:
+            new_train_ds = TensorDataset(combined_vel, combined_UU0, combined_labels)
+
+        dataloader['train'] = DataLoader(
+            new_train_ds,
+            batch_size=args.batch_size_v, shuffle=True, drop_last=True,
+            pin_memory=pin_mem, num_workers=num_workers, prefetch_factor=prefetch_factor,
+        )
+
+        print(f'    [Replay] 训练集合并完成: {combined_vel.shape[0]} 样本 (含 replay)')
 
     # ---- 4. 初始化优化器与调度器 ----
     optimizer = optim.Adam(model.parameters(), lr=stage_lr, weight_decay=args.weight_decay)
@@ -113,6 +213,36 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
             y_sobol_base = sobol_engine.draw(sobol_pts).to(device)
             y_sobol_base = y_sobol_base * sobol_scale.to(device)
 
+        # y_ran: 每 epoch 生成一次（epoch shared 路径）
+        y_ran_epoch_shared = None
+        if not use_sobol and getattr(args, 'use_y_ran', False) and getattr(args, 'use_epoch_shared_y_ran', False):
+            should_update_prob = (
+                epoch_prob is None
+                or args.y_ran_prob_update_every == 1
+                or (args.y_ran_prob_update_every > 1 and i % args.y_ran_prob_update_every == 0)
+            )
+            if should_update_prob:
+                with torch.no_grad():
+                    epoch_prob, epoch_score = build_epoch_velocity_gradient_prob(
+                        train_loader=dataloader['train'],
+                        device=device,
+                        use_max_mix=args.y_ran_use_max_mix,
+                        mean_weight=args.y_ran_mean_weight,
+                        max_weight=args.y_ran_max_weight,
+                    )
+
+            with torch.no_grad():
+                y_ran_epoch_shared = sample_shared_y_ran_from_epoch_prob(
+                    prob=epoch_prob,
+                    args=args,
+                    num_pts=args.y_ran_num_pts,
+                    structure_ratio=args.y_ran_structure_ratio,
+                    surface_ratio=args.y_ran_surface_ratio,
+                    uniform_ratio=args.y_ran_uniform_ratio,
+                    source_ratio=args.y_ran_source_ratio,
+                    surface_depth_grids=args.y_ran_surface_depth_grids,
+                )
+
         has_freq = len(dataloader['train'].dataset.tensors) >= 4
         for batch_data in dataloader['train']:
             if has_freq:
@@ -152,40 +282,16 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
                 del loss, loss_f, loss_u, loss_r, loss_env, y_sobol
 
             else:
-                # epoch-level 共享 y_ran 采样
-                if getattr(args, 'use_epoch_shared_y_ran', False):
-                    should_update_prob = (
-                        epoch_prob is None
-                        or args.y_ran_prob_update_every == 1
-                        or (args.y_ran_prob_update_every > 1 and i % args.y_ran_prob_update_every == 0)
-                    )
-                    if should_update_prob:
-                        with torch.no_grad():
-                            epoch_prob, epoch_score = build_epoch_velocity_gradient_prob(
-                                train_loader=dataloader['train'],
-                                device=device,
-                                use_max_mix=args.y_ran_use_max_mix,
-                                mean_weight=args.y_ran_mean_weight,
-                                max_weight=args.y_ran_max_weight,
-                            )
-
-                    with torch.no_grad():
-                        y_shared = sample_shared_y_ran_from_epoch_prob(
-                            prob=epoch_prob,
-                            args=args,
-                            num_pts=args.y_ran_num_pts,
-                            structure_ratio=args.y_ran_structure_ratio,
-                            surface_ratio=args.y_ran_surface_ratio,
-                            uniform_ratio=args.y_ran_uniform_ratio,
-                            source_ratio=args.y_ran_source_ratio,
-                            surface_depth_grids=args.y_ran_surface_depth_grids,
-                        )
-                    y_ran = y_shared.unsqueeze(0).expand(
+                # y_ran: 使用 epoch 预生成或 per-model 生成
+                if y_ran_epoch_shared is not None:
+                    y_ran = y_ran_epoch_shared.unsqueeze(0).expand(
                         vel_batch.shape[0], -1, -1
                     ).clone().requires_grad_(True)
-                else:
+                elif getattr(args, 'use_y_ran', False):
                     with torch.no_grad():
                         y_ran = model.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+                else:
+                    y_ran = None
 
                 for batch in dataloader['train_y']:
                     y_batch = batch[0].to(device)
@@ -311,9 +417,6 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
             test_plot(args, model, fno, i, dataloader["test"], vel_test, UU0_test, labels_test,
                       f'train_stage{stage_idx}', if_fine_tune=False, freq=freq_test)
             plot_sinlge(model, args, 6, vel_test, UU0_test, labels_test, freq=freq_test)
-
-            torch.cuda.empty_cache()
-            gc.collect()
 
         # ---- 模型保存 ----
         if i % args.save_model_every == 0:
@@ -470,6 +573,36 @@ def train_single(args, device):
             y_sobol_base = sobol_engine.draw(sobol_pts).to(device)
             y_sobol_base = y_sobol_base * sobol_scale.to(device)
 
+        # y_ran: 每 epoch 生成一次（epoch shared 路径）
+        y_ran_epoch_shared = None
+        if not use_sobol and getattr(args, 'use_y_ran', False) and getattr(args, 'use_epoch_shared_y_ran', False):
+            should_update_prob = (
+                epoch_prob is None
+                or args.y_ran_prob_update_every == 1
+                or (args.y_ran_prob_update_every > 1 and i % args.y_ran_prob_update_every == 0)
+            )
+            if should_update_prob:
+                with torch.no_grad():
+                    epoch_prob, epoch_score = build_epoch_velocity_gradient_prob(
+                        train_loader=dataloader['train'],
+                        device=device,
+                        use_max_mix=args.y_ran_use_max_mix,
+                        mean_weight=args.y_ran_mean_weight,
+                        max_weight=args.y_ran_max_weight,
+                    )
+
+            with torch.no_grad():
+                y_ran_epoch_shared = sample_shared_y_ran_from_epoch_prob(
+                    prob=epoch_prob,
+                    args=args,
+                    num_pts=args.y_ran_num_pts,
+                    structure_ratio=args.y_ran_structure_ratio,
+                    surface_ratio=args.y_ran_surface_ratio,
+                    uniform_ratio=args.y_ran_uniform_ratio,
+                    source_ratio=args.y_ran_source_ratio,
+                    surface_depth_grids=args.y_ran_surface_depth_grids,
+                )
+
         has_freq = len(dataloader['train'].dataset.tensors) >= 4
         for batch_data in dataloader['train']:
             if has_freq:
@@ -509,40 +642,16 @@ def train_single(args, device):
                 del loss, loss_f, loss_u, loss_r, loss_env, y_sobol
 
             else:
-                # epoch-level 共享 y_ran 采样
-                if getattr(args, 'use_epoch_shared_y_ran', False):
-                    should_update_prob = (
-                        epoch_prob is None
-                        or args.y_ran_prob_update_every == 1
-                        or (args.y_ran_prob_update_every > 1 and i % args.y_ran_prob_update_every == 0)
-                    )
-                    if should_update_prob:
-                        with torch.no_grad():
-                            epoch_prob, epoch_score = build_epoch_velocity_gradient_prob(
-                                train_loader=dataloader['train'],
-                                device=device,
-                                use_max_mix=args.y_ran_use_max_mix,
-                                mean_weight=args.y_ran_mean_weight,
-                                max_weight=args.y_ran_max_weight,
-                            )
-
-                    with torch.no_grad():
-                        y_shared = sample_shared_y_ran_from_epoch_prob(
-                            prob=epoch_prob,
-                            args=args,
-                            num_pts=args.y_ran_num_pts,
-                            structure_ratio=args.y_ran_structure_ratio,
-                            surface_ratio=args.y_ran_surface_ratio,
-                            uniform_ratio=args.y_ran_uniform_ratio,
-                            source_ratio=args.y_ran_source_ratio,
-                            surface_depth_grids=args.y_ran_surface_depth_grids,
-                        )
-                    y_ran = y_shared.unsqueeze(0).expand(
+                # y_ran: 使用 epoch 预生成或 per-model 生成
+                if y_ran_epoch_shared is not None:
+                    y_ran = y_ran_epoch_shared.unsqueeze(0).expand(
                         vel_batch.shape[0], -1, -1
                     ).clone().requires_grad_(True)
-                else:
+                elif getattr(args, 'use_y_ran', False):
                     with torch.no_grad():
                         y_ran = model.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+                else:
+                    y_ran = None
 
                 for batch in dataloader['train_y']:
                     y_batch = batch[0].to(device)
@@ -662,9 +771,6 @@ def train_single(args, device):
             test_plot(args, model, fno, i, dataloader["test"], vel_test, UU0_test, labels_test, 'train', if_fine_tune=False, freq=freq_test)
             plot_sinlge(model, args, 6, vel_test, UU0_test, labels_test, freq=freq_test)
 
-            torch.cuda.empty_cache()
-            gc.collect()
-
         # ---- 模型保存 ----
         if i % args.save_model_every == 0:
             pbar.write(f'>>> Epoch {i} | 保存 Checkpoint: Total Loss {loss_log[-1]:.4e} | PDE Loss {loss_pde_log[-1]:.4e}')
@@ -706,5 +812,3 @@ def train(args):
     except Exception as e:
         print(f"训练过程中断出错: {e}")
         raise
-    finally:
-        torch.cuda.empty_cache()
