@@ -169,31 +169,31 @@ class GaussianWeightedLayer(nn.Module):
         # global_avg = global_avg.squeeze(-1).squeeze(-1)  # (b1, feat_dim) → 直接挤压，无需中间unsqueeze
         # -------------------------- 2. 向量化坐标映射（避免循环，直接计算索引）--------------------------
         # 假设centers是归一化坐标（如[-1,1]），映射到特征图尺寸[0, H-1]和[0, W-1]
-        z_indices = (centers[..., 0] / self.dh).long().clamp(0, H - 1).detach()
-        x_indices = (centers[..., 1] / self.dh).long().clamp(0, W - 1).detach()
-        # 2. 构造 Batch 索引
-        # shape: (b1, 1)
-        b1_idx = torch.arange(b1, device=speed_maps.device).view(-1, 1)
+        # z_indices = (centers[..., 0] / self.dh).long().clamp(0, H - 1).detach()
+        # x_indices = (centers[..., 1] / self.dh).long().clamp(0, W - 1).detach()
+        # # 2. 构造 Batch 索引
+        # # shape: (b1, 1)
+        # b1_idx = torch.arange(b1, device=speed_maps.device).view(-1, 1)
         
-        # 3. 高效索引 (关键修改)
-        # PyTorch 规则：当高级索引 (b1_idx, z_indices, x_indices) 被切片 (:) 隔开时，
-        # 被索引的维度会移动到最前面。
-        # speed_maps shape: [B1, C, H, W]
-        # b1_idx (dim 0) 和 z/x_indices (dim 2,3) 广播后的 shape 是 [B1, B2]
-        # 因此结果 shape 会变成: [B1, B2, C] (索引维度在前，特征维度 C 被挤到最后)
+        # # 3. 高效索引 (关键修改)
+        # # PyTorch 规则：当高级索引 (b1_idx, z_indices, x_indices) 被切片 (:) 隔开时，
+        # # 被索引的维度会移动到最前面。
+        # # speed_maps shape: [B1, C, H, W]
+        # # b1_idx (dim 0) 和 z/x_indices (dim 2,3) 广播后的 shape 是 [B1, B2]
+        # # 因此结果 shape 会变成: [B1, B2, C] (索引维度在前，特征维度 C 被挤到最后)
         
-        # (B1, C, H, W) -> [索引操作] -> (B1, B2, C)
-        extracted_feat = speed_maps[b1_idx, :, z_indices, x_indices]
+        # # (B1, C, H, W) -> [索引操作] -> (B1, B2, C)
+        # extracted_feat = speed_maps[b1_idx, :, z_indices, x_indices]
 
         # -------------------------- 4. 合并结果（利用广播避免显式expand）--------------------------
         # global_avg.unsqueeze(1) → (b1, 1, feat_dim)，与center_values(b1, b2, feat_dim)自动广播
         # print('global_avg', global_avg.shape)
         # print('center_values', center_values.shape)
-            
-        combined = B_global.unsqueeze(1) + extracted_feat
-        # print('com', combined.shape)
-        if not cre:
-            combined = combined - extracted_feat
+        combined = B_global.unsqueeze(1)
+        # combined = B_global.unsqueeze(1) + extracted_feat
+        # # print('com', combined.shape)
+        # if not cre:
+        #     combined = combined - extracted_feat
         
         return combined
 

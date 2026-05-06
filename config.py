@@ -4,7 +4,7 @@ class Args:
     # ==========================================
     load_path = '/home/sharedata/zdg'         # 数据集加载根目录
     weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
-    save_doc = 'output_stage'                       # 结果输出文件夹名称
+    save_doc = 'output2'                       # 结果输出文件夹名称
     filename = 'PI_DeepONet_pde'              # 保存的模型前缀名称
 
     # 训练数据文件名
@@ -13,10 +13,16 @@ class Args:
     # wavefield_filename = 'wavefield_data_freq5_5sources_70_70_n1.npy'
 
     # 自由表面训练数据
-    vel_filename = 'freesurface_velocity_freq3to20_5sources_160_180_pml20_n1.npy'
-    backgroundfield_filename = 'freesurface_backgroundfield_freq3to20_5sources_160_180_pml20_n1.npy'
-    wavefield_filename = 'freesurface_wavefield_freq3to20_5sources_160_180_pml20_n1.npy'
-    freq_filename = 'freesurface_freq_used_5sources_160_180_pml20_n1.npy'               # 频率数据 [N_vel]，每个速度模型对应一个频率
+    # vel_filename = 'freesurface_velocity_freq3to20_5sources_160_180_pml20_n1.npy'
+    # backgroundfield_filename = 'freesurface_backgroundfield_freq3to20_5sources_160_180_pml20_n1.npy'
+    # wavefield_filename = 'freesurface_wavefield_freq3to20_5sources_160_180_pml20_n1.npy'
+    # freq_filename = 'freesurface_freq_used_5sources_160_180_pml20_n1.npy'
+
+    # 合并训练数据 (freq3to11 + freq12to18 + freq18to25)
+    vel_filename = 'multifreq_selected/freesurface_velocity_freq3to25_5sources_160_180_pml20_n1.npy'
+    backgroundfield_filename = 'multifreq_selected/freesurface_backgroundfield_freq3to25_5sources_160_180_pml20_n1.npy'
+    wavefield_filename = 'multifreq_selected/freesurface_wavefield_freq3to25_5sources_160_180_pml20_n1.npy'
+    freq_filename = 'multifreq_selected/freesurface_freq_used_5sources_160_180_pml20_n1.npy'               # 频率数据 [N_vel]，每个速度模型对应一个频率
     default_freq = 5.0                                                 # 默认频率 (Hz)，当 freq 文件不存在或 freq_batch=None 时使用
 
     # 外部泛化测试集配置 (支持动态扩展)
@@ -33,7 +39,7 @@ class Args:
     # 2. 硬件与设备配置 (Hardware & Device)
     # ==========================================
     device = 1                                # 单 GPU 模式: 指定使用的 GPU 设备编号
-    use_parallel = True                      # 是否启用多 GPU 并行训练 (True: 多GPU | False: 单GPU)
+    use_parallel = False                      # 是否启用多 GPU 并行训练 (True: 多GPU | False: 单GPU)
     num_gpus = 2                              # 使用的 GPU 数量
     min_gpu_memory = 23 * 1024                # GPU 最小可用内存 (MB)，低于此值的 GPU 不会被使用
 
@@ -56,7 +62,7 @@ class Args:
     # ==========================================
     # 4. 数据集与采样 (Dataset & Sampling)
     # ==========================================
-    nvel_train = 1500                           # 训练所用的速度模型数量
+    nvel_train = 4500                           # 训练所用的速度模型数量
     source_list = [0]                         # [0, 1, 2, 3, 4] 训练数据中包含的震源编号列表 (0-4 共5个震源)
 
     # 空间点采样模式
@@ -64,8 +70,8 @@ class Args:
     halton_sample_ratio = 0.5                   # Halton 采样比例（仅在 sampling_mode='halton' 时生效，如 0.2 表示采样 20% 的网格点）
 
     # 批处理配置
-    batch_size = 1000                          # Trunk Net 坐标采样批次大小 (num_sample)
-    batch_size_v = 35                          # Branch Net 速度场/背景场批次大小 (Batch_v)
+    batch_size = 1500                          # Trunk Net 坐标采样批次大小 (num_sample)
+    batch_size_v = 45                          # Branch Net 速度场/背景场批次大小 (Batch_v)
     ny_train = int(nz * nx * halton_sample_ratio)  # 训练集空间采样点总数 (由网格尺寸和采样比例自动计算)
     accumulation_steps = 4                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
 
@@ -78,13 +84,13 @@ class Args:
     # 5. 训练超参数 (Training Hyperparameters)
     # ==========================================
     NIter = 6000 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
-    lr = 1 * 1e-4                             # 初始基础学习率
+    lr = 2 * 1e-4                             # 初始基础学习率
     weight_decay = 1e-4                       # 优化器权重衰减 (L2 正则化)系数
 
     # 学习率调度器 (ReduceLROnPlateau)
     warmup_epochs = 100                       # 学习率热身 (Warmup) 的 epoch 数
     factor = 0.9                              # 学习率衰减因子
-    patience = 30                             # 触发衰减的容忍 epoch 数量
+    patience = 50                             # 触发衰减的容忍 epoch 数量
     min_lr = 1e-5                             # 允许的最小学习率
 
     # ==========================================
@@ -105,8 +111,8 @@ class Args:
     # 7. 训练控制与保存 (Training Control & Checkpoints)
     # ==========================================
     if_load_model = False                     # 是否加载预训练模型权重继续训练
-    validate_every = 100                      # 每隔多少个 epoch 执行一次模型验证
-    save_fig_every = 50                       # 每隔多少个 epoch 保存一次验证/测试可视化图片
+    validate_every = 200                      # 每隔多少个 epoch 执行一次模型验证
+    save_fig_every = 100                       # 每隔多少个 epoch 保存一次验证/测试可视化图片
     save_model_every = 500                    # 每隔多少个 epoch 保存一次模型权重文件
 
     # ==========================================
@@ -146,7 +152,7 @@ class Args:
     # ==========================================
     # 12. 三阶段渐进训练 (Staged Curriculum Training)
     # ==========================================
-    staged_training = True                   # 总开关，False 则使用原始单阶段训练
+    staged_training = False                   # 总开关，False 则使用原始单阶段训练
 
     # 每阶段使用独立数据集，文件名通过 freq_range 替换基础文件名中的 'freq3to20' 得到
     # 例如基础文件名含 'freq3to20' → Stage 0 替换为 'freq3to11'
@@ -155,8 +161,8 @@ class Args:
             'name': 'low_freq',
             'freq_range': '3to11',               # 替换基础文件名中的 'freq3to20'
             'freq_min': 3.0, 'freq_max': 11.0,   # 信息标签，用于日志打印
-            'NIter': 1001,
-            'lr': 1e-4,                           # 从头训练，完整 LR
+            'NIter': 6001,
+            'lr': 2e-4,                           # 从头训练，完整 LR
             'warmup_epochs': 100,
             'a': 1, 'b': 1, 'c': 0,
             'replay_stages': [],
@@ -167,8 +173,8 @@ class Args:
             'name': 'mid_freq',
             'freq_range': '12to18',
             'freq_min': 12.0, 'freq_max': 18.0,
-            'NIter': 1001,
-            'lr': 5e-5,                           # 课程学习，适度降低
+            'NIter': 2001,
+            'lr': 1e-4,                           # 课程学习，适度降低
             'warmup_epochs': 50,
             'a': 1, 'b': 1, 'c': 0,
             'replay_stages': [0],
@@ -180,7 +186,7 @@ class Args:
             'freq_range': '18to25',
             'freq_min': 18.0, 'freq_max': 25.0,
             'NIter': 1001,
-            'lr': 2e-5,                           # 高频更难，进一步降低
+            'lr': 5e-5,                           # 高频更难，进一步降低
             'warmup_epochs': 50,
             'a': 1, 'b': 1, 'c': 0,
             'replay_stages': [0, 1],
@@ -192,11 +198,11 @@ class Args:
     # ==========================================
     # 13. y_ran Epoch-Level 共享采样 (Epoch Shared Sampling)
     # ==========================================
-    use_y_ran = True                          # False: 不使用自由点 | True: 使用 y_ran 自由点参与 PDE 计算
+    use_y_ran = False                          # False: 不使用自由点 | True: 使用 y_ran 自由点参与 PDE 计算
 
     use_epoch_shared_y_ran = True              # True: 使用 epoch 级共享采样 | False: 使用原始 per-model 采样
 
-    y_ran_num_pts = 500                        # y_ran 采样点总数
+    y_ran_num_pts = 300                        # y_ran 采样点总数
     y_ran_structure_ratio = 0.60               # epoch-structure 采样点比例
     y_ran_surface_ratio = 0.20                 # 表层采样点比例
     y_ran_uniform_ratio = 0.20                 # 均匀采样点比例

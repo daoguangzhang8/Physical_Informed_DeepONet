@@ -17,7 +17,7 @@ class Pi_DeepONet(nn.Module):
         super().__init__()
         self.args = args  # 保存args以便其他方法使用
         self.device = args.device
-        self.feat_dim = 256  # 特征维度，必须能被注意力头数整除
+        self.feat_dim = 128  # 特征维度，必须能被注意力头数整除
 
         # --- 超参数 ---
         input_shape_branch1 = args.input_shape_branch1
@@ -32,10 +32,10 @@ class Pi_DeepONet(nn.Module):
 
         # --- 网络分支 (Branch) ---
         self.branch1 = nn.Sequential(
-            FNO2d(input_shape_branch1[1], self.feat_dim, modes1=16, modes2=16, width=32),
+            FNO2d(input_shape_branch1[1], self.feat_dim, modes1=12, modes2=12, width=32),
         )
         self.branch2 = nn.Sequential(
-            FNO2d(input_shape_branch2[1], self.feat_dim, modes1=16, modes2=16, width=32),
+            FNO2d(input_shape_branch2[1], self.feat_dim, modes1=32, modes2=32, width=32),
         )
         
         # --- 注意力与特征融合 ---
@@ -48,7 +48,7 @@ class Pi_DeepONet(nn.Module):
         self.smooth_feature_encoder = SmoothBlockEncoder(self.feat_dim, self.feat_dim, grid_size=40)
 
         # --- 主干网络 (Trunk) 与输出层 ---
-        self.trunk = FiLMTrunk(input_dim=16, width=self.feat_dim)
+        self.trunk = FiLMTrunk(input_dim=16, width=self.feat_dim, branch_feat_dim=self.feat_dim)
         self.final_layer = nn.Linear(self.feat_dim, 2)  # 输出实部和虚部
         
         # --- 损失函数组件 ---
@@ -58,14 +58,29 @@ class Pi_DeepONet(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """初始化网络权重"""
+        """初始化网络权重，Sin 激活层使用 SIREN 初始化 (Sitzmann et al., 2020)"""
+        # 收集 Sin 激活前的 Linear 层
+        # SIREN: W ~ U(-sqrt(6/fan_in), sqrt(6/fan_in))，保持 sin 激活各层方差稳定
+        sin_linears = set()
+        for module in self.modules():
+            if isinstance(module, FiLMTrunk):
+                # fc1/fc2/fc3 后接 Sin，fc4 是输出层无激活
+                sin_linears.update([module.fc1, module.fc2, module.fc3])
+            elif isinstance(module, GaussianWeightedLayer):
+                # compress: [Linear→Sin, Linear→Sin, Linear(输出)]
+                sin_linears.update([module.compress[0], module.compress[2]])
+
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Conv3d)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
+                if m in sin_linears:
+                    bound = np.sqrt(6.0 / m.in_features)
+                    nn.init.uniform_(m.weight, -bound, bound)
+                else:
+                    nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
@@ -116,7 +131,7 @@ class Pi_DeepONet(nn.Module):
                       f"y_encoded: {y_encoded.shape}, k_encoded: {k_encoded.shape}, alpha: {alpha.shape}")
                 self._kpe_shape_logged = True
             k_dim = y_encoded.shape[-1]
-            y_encoded = y_encoded + alpha * k_encoded[:, :, :k_dim]
+            y_encoded = y_encoded + 0 * k_encoded[:, :, :k_dim]
         
         # --- 2. Branch 特征提取与 Tokenization (Memory/Key-Value) ---
         B1_raw = self.branch1(vel)
@@ -522,6 +537,6 @@ class Pi_DeepONet(nn.Module):
         loss_r = 0.0
 
         # 5. 加权求和
-        loss_val = a * loss_u + b * loss_f + d * loss_env
+        loss_val = a * loss_u + b * loss_f + 0 * loss_env
 
         return loss_val, loss_f, loss_u, loss_r, loss_env
