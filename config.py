@@ -4,7 +4,7 @@ class Args:
     # ==========================================
     load_path = '/home/sharedata/zdg'         # 数据集加载根目录
     weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
-    save_doc = 'output2'                       # 结果输出文件夹名称
+    save_doc = 'output1'                       # 结果输出文件夹名称
     filename = 'PI_DeepONet_pde'              # 保存的模型前缀名称
 
     # 训练数据文件名
@@ -58,6 +58,7 @@ class Args:
     # 'full_pml': 四边 PML 吸收边界，原始数据 90×90 → 网络输入 72×72
     # 'free_surface': 顶部自由表面 + 其他三边 PML，原始数据 80×90 → 网络输入 71×72
     boundary_type = 'free_surface'            # 根据实际数据选择
+    n_freq_ranges = 3                          # 合并数据来源的频段数量 (单频数据设为1)
 
     # ==========================================
     # 4. 数据集与采样 (Dataset & Sampling)
@@ -83,15 +84,24 @@ class Args:
     # ==========================================
     # 5. 训练超参数 (Training Hyperparameters)
     # ==========================================
-    NIter = 6000 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
+    NIter = 2000 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
     lr = 2 * 1e-4                             # 初始基础学习率
     weight_decay = 1e-4                       # 优化器权重衰减 (L2 正则化)系数
 
-    # 学习率调度器 (ReduceLROnPlateau)
+    # 学习率调度器
+    scheduler_type = 'cosine'               # 'plateau': ReduceLROnPlateau | 'cosine': CosineAnnealingWarmRestarts
+    use_warmup = False                        # 是否启用 warmup 预热
     warmup_epochs = 100                       # 学习率热身 (Warmup) 的 epoch 数
+
+    # ReduceLROnPlateau 参数
     factor = 0.9                              # 学习率衰减因子
-    patience = 50                             # 触发衰减的容忍 epoch 数量
+    patience = 20                             # 触发衰减的容忍 epoch 数量
     min_lr = 1e-5                             # 允许的最小学习率
+
+    # CosineAnnealingWarmRestarts 参数
+    cosine_T_0 = 700                         # 首个周期的 epoch 长度
+    cosine_T_mult = 2                         # 后续周期倍增系数 (T_0, T_0*2, T_0*4, ...)
+    cosine_eta_min = 1e-5                     # 余弦退火最低学习率
 
     # ==========================================
     # 6. 损失函数 (Loss Function)

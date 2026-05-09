@@ -117,21 +117,21 @@ class Pi_DeepONet(nn.Module):
         x_encoded = self.pos_encoder(x_normalized)
         y_encoded = torch.cat([z_encoded, x_encoded], dim=2)  # [B_v, B_pts, 16]
 
-        # 残差波数 PE: freq 来自 freq_batch, c_ref 来自速度场均值
-        if self.kpe_alpha.item() != 0.0 or self.training:
-            if freq_batch is None:
-                freq_batch = torch.full((vel.shape[0],), self.args.default_freq, device=vel.device)
-            c_ref = vel.mean(dim=[2, 3]).squeeze(1)  # [B_v], 每个样本的平均速度
-            omega = 2 * np.pi * freq_batch * 1e-3  # [B_v]
-            k_ref = (omega / c_ref).unsqueeze(-1).unsqueeze(-1)  # [B_v, 1, 1]
-            k_encoded = self.kpe(y, k_ref)  # [B_v, B_pts, embed_dim*4]
-            alpha = 0.1 * torch.tanh(self.kpe_alpha)
-            if not hasattr(self, '_kpe_shape_logged'):
-                print(f"[DEBUG] kpe shapes — y: {y.shape}, k_ref: {k_ref.shape}, "
-                      f"y_encoded: {y_encoded.shape}, k_encoded: {k_encoded.shape}, alpha: {alpha.shape}")
-                self._kpe_shape_logged = True
-            k_dim = y_encoded.shape[-1]
-            y_encoded = y_encoded + 0 * k_encoded[:, :, :k_dim]
+        # 残差波数 PE (已禁用，保留代码备用)
+        # if self.kpe_alpha.item() != 0.0 or self.training:
+        #     if freq_batch is None:
+        #         freq_batch = torch.full((vel.shape[0],), self.args.default_freq, device=vel.device)
+        #     c_ref = vel.mean(dim=[2, 3]).squeeze(1)
+        #     omega = 2 * np.pi * freq_batch * 1e-3
+        #     k_ref = (omega / c_ref).unsqueeze(-1).unsqueeze(-1)
+        #     k_encoded = self.kpe(y, k_ref)
+        #     alpha = 0.1 * torch.tanh(self.kpe_alpha)
+        #     if not hasattr(self, '_kpe_shape_logged'):
+        #         print(f"[DEBUG] kpe shapes — y: {y.shape}, k_ref: {k_ref.shape}, "
+        #               f"y_encoded: {y_encoded.shape}, k_encoded: {k_encoded.shape}, alpha: {alpha.shape}")
+        #         self._kpe_shape_logged = True
+        #     k_dim = y_encoded.shape[-1]
+        #     y_encoded = y_encoded + alpha * k_encoded[:, :, :k_dim]
         
         # --- 2. Branch 特征提取与 Tokenization (Memory/Key-Value) ---
         B1_raw = self.branch1(vel)
@@ -476,10 +476,11 @@ class Pi_DeepONet(nn.Module):
         pred_y = Delta_U[:, :n_y, :]
         loss_u = self.loss_function(pred_y, labels) / data_norm_coe
 
-        # 5. Envelope loss: 仅在标签点上计算
-        env_pred = torch.sqrt(pred_y[..., 0]**2 + pred_y[..., 1]**2 + 1e-8)
-        env_label = torch.sqrt(labels[..., 0]**2 + labels[..., 1]**2 + 1e-8)
-        loss_env = self.loss_function(env_pred, env_label) / env_norm_coe
+        # 5. Envelope loss (已禁用)
+        # env_pred = torch.sqrt(pred_y[..., 0]**2 + pred_y[..., 1]**2 + 1e-8)
+        # env_label = torch.sqrt(labels[..., 0]**2 + labels[..., 1]**2 + 1e-8)
+        # loss_env = self.loss_function(env_pred, env_label) / env_norm_coe
+        loss_env = torch.tensor(0.0, device=vel.device)
 
         # 6. PDE loss: 使用完整输出计算物理残差
         loss_f_combined = self._compute_pde_residual(vel, y_combined, UU0, Delta_U, freq_batch=freq_batch) / pde_norm_coe
@@ -487,7 +488,7 @@ class Pi_DeepONet(nn.Module):
         loss_r = 0.0  # 占位
 
         # 7. 根据权重加权求和
-        loss_val = a * loss_u + b * loss_f_combined + d * loss_env
+        loss_val = a * loss_u + b * loss_f_combined
 
         return loss_val, loss_f_combined, loss_u, loss_r, loss_env
 
@@ -526,10 +527,11 @@ class Pi_DeepONet(nn.Module):
         pred_y = Delta_U[:, :n_y, :]
         loss_u = self.loss_function(pred_y, labels_extracted) / data_norm_coe
 
-        # 3. Envelope loss
-        env_pred = torch.sqrt(pred_y[..., 0]**2 + pred_y[..., 1]**2 + 1e-8)
-        env_label = torch.sqrt(labels_extracted[..., 0]**2 + labels_extracted[..., 1]**2 + 1e-8)
-        loss_env = self.loss_function(env_pred, env_label) / env_norm_coe
+        # 3. Envelope loss (已禁用)
+        # env_pred = torch.sqrt(pred_y[..., 0]**2 + pred_y[..., 1]**2 + 1e-8)
+        # env_label = torch.sqrt(labels_extracted[..., 0]**2 + labels_extracted[..., 1]**2 + 1e-8)
+        # loss_env = self.loss_function(env_pred, env_label) / env_norm_coe
+        loss_env = torch.tensor(0.0, device=vel.device)
 
         # 4. PDE 物理残差损失
         loss_f = self._compute_pde_residual(vel, y_combined, UU0, Delta_U, freq_batch=freq_batch) / pde_norm_coe
@@ -537,6 +539,6 @@ class Pi_DeepONet(nn.Module):
         loss_r = 0.0
 
         # 5. 加权求和
-        loss_val = a * loss_u + b * loss_f + 0 * loss_env
+        loss_val = a * loss_u + b * loss_f
 
         return loss_val, loss_f, loss_u, loss_r, loss_env

@@ -97,7 +97,8 @@ def plot_sinlge(model, args, times, vel_pred, UU0_pred, labels_pred, freq=None):
     ax1.plot(x_pred, U_pred_real_test[:, mid_x_idx_pred], label='Predicted Real', linewidth=1.5, color='#1f77b4')
     
     # 图表美化
-    ax1.set_title(f'Real Part Comparison at Mid X-Line ({args.boundary_type})', fontsize=12)
+    freq_str = f'{freq.item():.1f}Hz' if freq is not None else ''
+    ax1.set_title(f'Real Part Comparison at Mid X-Line ({args.boundary_type}) {freq_str}', fontsize=12)
     ax1.set_xlabel('Distance (m)', fontsize=10)
     ax1.set_ylabel('Amplitude', fontsize=10)
     ax1.set_xlim(0, physical_size_x)
@@ -221,32 +222,37 @@ def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_
     print(f"MSE: {metrics_imag['mse']:.6f}")
     print(f"MAE: {metrics_imag['mae']:.6f}")
     print(f"R²:  {metrics_imag['r2']:.6f}")
-    # 绘制预测结果（与原逻辑一致）
+    # 绘制预测结果（统一 colorbar 范围）
+    real_max = max(np.abs(U_ref_real).max(), np.abs(U_pred_real).max())
+    imag_max = max(np.abs(U_ref_imag).max(), np.abs(U_pred_imag).max())
+
+    freq_str = f'{freq.item():.1f}Hz' if freq is not None else ''
+
     fig1 = plt.figure(figsize=(10, 10))
     plt.subplot(2, 2, 1)
-    plt.imshow(U_ref_real, aspect='auto', cmap='seismic')
-    plt.title('ref real')
+    plt.imshow(U_ref_real, aspect='auto', cmap='seismic', vmin=-real_max, vmax=real_max)
+    plt.title(f'ref real {freq_str}')
     plt.colorbar()
     plt.xlabel('X')
     plt.ylabel('Z')
 
     plt.subplot(2, 2, 2)
-    plt.imshow(U_pred_real, aspect='auto', cmap='seismic')
-    plt.title(f'pred real epoch {i}')
+    plt.imshow(U_pred_real, aspect='auto', cmap='seismic', vmin=-real_max, vmax=real_max)
+    plt.title(f'pred real epoch {i} {freq_str}')
     plt.colorbar()
     plt.xlabel('X')
     plt.ylabel('Z')
 
     plt.subplot(2, 2, 3)
-    plt.imshow(U_ref_imag, aspect='auto', cmap='seismic')
-    plt.title('ref imag')
+    plt.imshow(U_ref_imag, aspect='auto', cmap='seismic', vmin=-imag_max, vmax=imag_max)
+    plt.title(f'ref imag {freq_str}')
     plt.colorbar()
     plt.xlabel('X')
     plt.ylabel('Z')
 
     plt.subplot(2, 2, 4)
-    plt.imshow(U_pred_imag, aspect='auto', cmap='seismic')
-    plt.title(f'pred imag epoch {i}')
+    plt.imshow(U_pred_imag, aspect='auto', cmap='seismic', vmin=-imag_max, vmax=imag_max)
+    plt.title(f'pred imag epoch {i} {freq_str}')
     plt.colorbar()
     plt.xlabel('X')
     plt.ylabel('Z')

@@ -167,13 +167,27 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
 
     # ---- 4. 初始化优化器与调度器 ----
     optimizer = optim.Adam(model.parameters(), lr=stage_lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=args.factor, patience=args.patience, min_lr=args.min_lr
-    )
-    warmup_scheduler = WarmupScheduler(
-        optimizer, warmup_epochs=stage_warmup, base_lr=stage_lr,
-        warmup_start_lr=stage_lr / 10., warmup_strategy="linear"
-    )
+
+    scheduler_type = getattr(args, 'scheduler_type', 'plateau')
+    if scheduler_type == 'cosine':
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=getattr(args, 'cosine_T_0', 1000),
+            T_mult=getattr(args, 'cosine_T_mult', 2),
+            eta_min=getattr(args, 'cosine_eta_min', 1e-6),
+        )
+    else:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=args.factor, patience=args.patience, min_lr=args.min_lr
+        )
+
+    use_warmup = getattr(args, 'use_warmup', False) and stage_warmup > 0
+    warmup_scheduler = None
+    if use_warmup:
+        warmup_scheduler = WarmupScheduler(
+            optimizer, warmup_epochs=stage_warmup, base_lr=stage_lr,
+            warmup_start_lr=stage_lr / 10., warmup_strategy="linear"
+        )
 
     # ---- 5. 训练状态 ----
     loss_log, loss_pde_log, loss_data_log, loss_reg_log, loss_env_log = [], [], [], [], []
@@ -186,7 +200,7 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
     if use_sobol:
         sobol_engine = torch.quasirandom.SobolEngine(dimension=2, scramble=True)
         valid_sobol_engine = torch.quasirandom.SobolEngine(dimension=2, scramble=True)
-        sobol_scale = torch.tensor([args.nz * args.dh, args.nx * args.dh], dtype=torch.float32)
+        sobol_scale = torch.tensor([args.nz * args.dh, args.nx * args.dh], dtype=torch.float32, device=device)
         sobol_pts = getattr(args, 'sobol_points_per_epoch', 800)
         valid_sobol_pts = getattr(args, 'valid_sobol_points', 800)
         print(f"Sobol 模式: 每 epoch {sobol_pts} 点, 验证 {valid_sobol_pts} 点")
@@ -211,7 +225,7 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
 
         if use_sobol:
             y_sobol_base = sobol_engine.draw(sobol_pts).to(device)
-            y_sobol_base = y_sobol_base * sobol_scale.to(device)
+            y_sobol_base = y_sobol_base * sobol_scale
 
         # y_ran: 每 epoch 生成一次（epoch shared 路径）
         y_ran_epoch_shared = None
@@ -348,8 +362,10 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
             'LR': f"{current_lr:.2e}"
         })
 
-        if i <= stage_warmup:
+        if use_warmup and warmup_scheduler is not None and i <= stage_warmup:
             warmup_scheduler.step(i)
+        elif scheduler_type == 'cosine':
+            scheduler.step()
         else:
             scheduler.step(avg_loss)
 
@@ -371,7 +387,7 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
 
                 if use_sobol:
                     y_valid = valid_sobol_engine.draw(valid_sobol_pts).to(device)
-                    y_valid = y_valid * sobol_scale.to(device)
+                    y_valid = y_valid * sobol_scale
                     y_valid = y_valid.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
 
                     _, loss_f_valid, loss_u_valid, _, _ = model.loss(
@@ -406,8 +422,8 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
             UU0_test = plot_data["UU0_test"]
             labels_test = plot_data["labels_test"]
             has_freq_plot = plot_data.get("has_freq", False)
-            freq_pred = plot_data["freq_valid"][0:1] if has_freq_plot else None
-            freq_test = plot_data["freq_train"][0:1] if has_freq_plot else None
+            freq_pred = plot_data["freq_valid"] if has_freq_plot else None
+            freq_test = plot_data["freq_train"] if has_freq_plot else None
 
             plot_loss(i, save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss,
                       suffix=f'_stage{stage_idx}')
@@ -457,11 +473,13 @@ def train_staged(args, device):
     model = Pi_DeepONet(args).to(device)
     print(f"PI_DeepONet 模型总参数数量：{count_parameters(model)}")
 
-    fno = FNO(args).to(device)
-    if args.use_fno_as_label and args.fno_weights_path:
-        fno.load_state_dict(torch.load(args.fno_weights_path, map_location=device)['model_state_dict'])
-        print(f"已加载 FNO 权重: {args.fno_weights_path}")
-    fno.eval()
+    fno = None
+    if args.use_fno_as_label:
+        fno = FNO(args).to(device)
+        if args.fno_weights_path:
+            fno.load_state_dict(torch.load(args.fno_weights_path, map_location=device)['model_state_dict'])
+            print(f"已加载 FNO 权重: {args.fno_weights_path}")
+        fno.eval()
 
     save_doc = args.save_doc
     os.makedirs(save_doc, exist_ok=True)
@@ -520,21 +538,40 @@ def train_single(args, device):
     model._init_weights()
     print(f"PI_DeepONet 模型总参数数量：{count_parameters(model)}")
 
-    fno = FNO(args).to(device)
-    if args.use_fno_as_label and args.fno_weights_path:
-        fno.load_state_dict(torch.load(args.fno_weights_path, map_location=device)['model_state_dict'])
-        print(f"已加载 FNO 权重: {args.fno_weights_path}")
-    fno.eval()
+    fno = None
+    if args.use_fno_as_label:
+        fno = FNO(args).to(device)
+        if args.fno_weights_path:
+            fno.load_state_dict(torch.load(args.fno_weights_path, map_location=device)['model_state_dict'])
+            print(f"已加载 FNO 权重: {args.fno_weights_path}")
+        fno.eval()
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=args.factor, patience=args.patience, min_lr=args.min_lr
-    )
-    warmup_scheduler = WarmupScheduler(
-        optimizer, warmup_epochs=args.warmup_epochs,
-        base_lr=args.lr, warmup_start_lr=args.lr / 10.,
-        warmup_strategy="linear"
-    )
+
+    # Scheduler 选择
+    scheduler_type = getattr(args, 'scheduler_type', 'plateau')
+    if scheduler_type == 'cosine':
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=getattr(args, 'cosine_T_0', 1000),
+            T_mult=getattr(args, 'cosine_T_mult', 2),
+            eta_min=getattr(args, 'cosine_eta_min', 1e-6),
+        )
+    else:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=args.factor, patience=args.patience, min_lr=args.min_lr
+        )
+
+    use_warmup = getattr(args, 'use_warmup', False)
+    warmup_scheduler = None
+    if use_warmup:
+        warmup_scheduler = WarmupScheduler(
+            optimizer, warmup_epochs=args.warmup_epochs,
+            base_lr=args.lr, warmup_start_lr=args.lr / 10.,
+            warmup_strategy="linear"
+        )
+
+    print(f"Scheduler: {scheduler_type}" + (f" (warmup {args.warmup_epochs} epochs)" if use_warmup else ""))
 
     loss_log, loss_pde_log, loss_data_log, loss_reg_log, loss_env_log = [], [], [], [], []
     valid_u_loss, valid_f_loss = [], []
@@ -547,7 +584,7 @@ def train_single(args, device):
     if use_sobol:
         sobol_engine = torch.quasirandom.SobolEngine(dimension=2, scramble=True)
         valid_sobol_engine = torch.quasirandom.SobolEngine(dimension=2, scramble=True)
-        sobol_scale = torch.tensor([args.nz * args.dh, args.nx * args.dh], dtype=torch.float32)
+        sobol_scale = torch.tensor([args.nz * args.dh, args.nx * args.dh], dtype=torch.float32, device=device)
         sobol_pts = getattr(args, 'sobol_points_per_epoch', 800)
         valid_sobol_pts = getattr(args, 'valid_sobol_points', 800)
         print(f"Sobol 模式: 每 epoch {sobol_pts} 点, 验证 {valid_sobol_pts} 点")
@@ -571,7 +608,7 @@ def train_single(args, device):
 
         if use_sobol:
             y_sobol_base = sobol_engine.draw(sobol_pts).to(device)
-            y_sobol_base = y_sobol_base * sobol_scale.to(device)
+            y_sobol_base = y_sobol_base * sobol_scale
 
         # y_ran: 每 epoch 生成一次（epoch shared 路径）
         y_ran_epoch_shared = None
@@ -708,8 +745,10 @@ def train_single(args, device):
             'LR': f"{current_lr:.2e}"
         })
 
-        if i <= args.warmup_epochs:
+        if use_warmup and warmup_scheduler is not None and i <= args.warmup_epochs:
             warmup_scheduler.step(i)
+        elif scheduler_type == 'cosine':
+            scheduler.step()
         else:
             scheduler.step(avg_loss)
 
@@ -731,7 +770,7 @@ def train_single(args, device):
 
                 if use_sobol:
                     y_valid = valid_sobol_engine.draw(valid_sobol_pts).to(device)
-                    y_valid = y_valid * sobol_scale.to(device)
+                    y_valid = y_valid * sobol_scale
                     y_valid = y_valid.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
 
                     _, loss_f_valid, loss_u_valid, _, _ = model.loss(
@@ -762,8 +801,8 @@ def train_single(args, device):
             vel_pred, UU0_pred, labels_pred = plot_data["vel_pred"], plot_data["UU0_pred"], plot_data["labels_pred"]
             vel_test, UU0_test, labels_test = plot_data["vel_test"], plot_data["UU0_test"], plot_data["labels_test"]
             has_freq = plot_data.get("has_freq", False)
-            freq_pred = plot_data["freq_valid"][0:1] if has_freq else None
-            freq_test = plot_data["freq_train"][0:1] if has_freq else None
+            freq_pred = plot_data["freq_valid"] if has_freq else None
+            freq_test = plot_data["freq_train"] if has_freq else None
 
             plot_loss(i, args.save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss)
 

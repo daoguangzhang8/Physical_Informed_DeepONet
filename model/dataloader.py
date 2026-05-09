@@ -204,7 +204,18 @@ def prepare_training_dataloaders(args, device):
         args.nz = vel.shape[1]
         args.nx = vel.shape[2]
 
-    # 3. 震源拆分与训练集生成
+    # 3. 多频段数据重排: [freq0_all, freq1_all, ...] → [src0_all, src1_all, ...]
+    n_freq = getattr(args, 'n_freq_ranges', 1)
+    if n_freq > 1:
+        n_src = UU0.shape[0] // vel.shape[0]  # 5
+        n_vel_per_freq = vel.shape[0] // n_freq
+        # reshape: (n_freq * n_src * n_vel_per_freq, C, H, W) → (n_freq, n_src, n_vel_per_freq, C, H, W)
+        UU0 = UU0.reshape(n_freq, n_src, n_vel_per_freq, *UU0.shape[1:])
+        UU0 = UU0.permute(1, 0, 2, *range(3, UU0.dim())).contiguous().reshape(n_src * vel.shape[0], *UU0.shape[3:])
+        UU = UU.reshape(n_freq, n_src, n_vel_per_freq, *UU.shape[1:])
+        UU = UU.permute(1, 0, 2, *range(3, UU.dim())).contiguous().reshape(n_src * vel.shape[0], *UU.shape[3:])
+
+    # 4. 震源拆分与训练集生成
     UU_loc = [UU[loc * len(vel) : (loc + 1) * len(vel), ...] for loc in range(5)]
     UU0_loc = [UU0[loc * len(vel) : (loc + 1) * len(vel), ...] for loc in range(5)]
     
@@ -216,8 +227,16 @@ def prepare_training_dataloaders(args, device):
     vel_train = vel_train / 1000.
     vel_valid = vel_valid / 1000.
 
-    vel_pred, UU0_pred, labels_pred = vel_valid[0:1], UU0_valid[0:1], labels_valid[0:1]
-    vel_test, UU0_test, labels_test = vel_train[0:1], UU0_train[0:1], labels_train[0:1]
+    # 绘图示例: 选取高频样本 (freq 值最大的样本)
+    if freq_train is not None:
+        hf_test_idx = freq_train.argmax().item()
+        hf_pred_idx = freq_valid.argmax().item()
+    else:
+        hf_test_idx = len(vel_train) - 1
+        hf_pred_idx = len(vel_valid) - 1
+
+    vel_pred, UU0_pred, labels_pred = vel_valid[hf_pred_idx:hf_pred_idx+1], UU0_valid[hf_pred_idx:hf_pred_idx+1], labels_valid[hf_pred_idx:hf_pred_idx+1]
+    vel_test, UU0_test, labels_test = vel_train[hf_test_idx:hf_test_idx+1], UU0_train[hf_test_idx:hf_test_idx+1], labels_train[hf_test_idx:hf_test_idx+1]
 
     # 5. 生成坐标网格点
     x_coords, z_coords = torch.arange(0, args.nx), torch.arange(0, args.nz)
@@ -242,16 +261,20 @@ def prepare_training_dataloaders(args, device):
     train_loaders = {
         "train": DataLoader(train_ds,
                             batch_size=args.batch_size_v, shuffle=True, drop_last=True,
-                            pin_memory=pin_mem, num_workers=num_workers, prefetch_factor=prefetch_factor),
+                            pin_memory=pin_mem, num_workers=num_workers, prefetch_factor=prefetch_factor,
+                            persistent_workers=True),
         "train_y": DataLoader(TensorDataset(y_train),
                               batch_size=args.batch_size, shuffle=True, pin_memory=pin_mem,
-                              num_workers=num_workers, prefetch_factor=prefetch_factor),
+                              num_workers=num_workers, prefetch_factor=prefetch_factor,
+                              persistent_workers=True),
         "valid": DataLoader(valid_ds,
                             batch_size=args.valid_batch_size_v, shuffle=True, drop_last=True,
-                            pin_memory=pin_mem, num_workers=num_workers, prefetch_factor=prefetch_factor),
+                            pin_memory=pin_mem, num_workers=num_workers, prefetch_factor=prefetch_factor,
+                            persistent_workers=True),
         "valid_y": DataLoader(TensorDataset(y_valid),
                               batch_size=args.valid_batch_size, shuffle=True, pin_memory=pin_mem,
-                              num_workers=num_workers, prefetch_factor=prefetch_factor),
+                              num_workers=num_workers, prefetch_factor=prefetch_factor,
+                              persistent_workers=True),
         "pred": DataLoader(TensorDataset(y_pred), batch_size=args.batch_size, shuffle=False),
         "test": DataLoader(TensorDataset(y_test), batch_size=args.batch_size, shuffle=False)
     }
@@ -259,8 +282,9 @@ def prepare_training_dataloaders(args, device):
     plot_data = {
         "vel_pred": vel_pred, "UU0_pred": UU0_pred, "labels_pred": labels_pred,
         "vel_test": vel_test, "UU0_test": UU0_test, "labels_test": labels_test,
-        "y_pred": y_pred,  # 供外部验证集复用坐标
-        "freq_train": freq_train, "freq_valid": freq_valid,
+        "y_pred": y_pred,
+        "freq_train": freq_train[hf_test_idx:hf_test_idx+1] if freq_train is not None else None,
+        "freq_valid": freq_valid[hf_pred_idx:hf_pred_idx+1] if freq_valid is not None else None,
         "has_freq": freq_train is not None,
     }
     
