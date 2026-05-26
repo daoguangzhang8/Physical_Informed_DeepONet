@@ -8,6 +8,7 @@
 import os
 import copy
 import time
+from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -31,6 +32,49 @@ from model.PI_DeepOnet import Pi_DeepONet
 from model.FNO import FNO
 from model.plotting import plot_loss, test_plot, plot_sinlge, fine_tuning
 from model.utils import count_parameters, WarmupScheduler
+
+
+def _ddp_lr(args, base_lr, world_size):
+    """Return the per-rank learning rate for DDP."""
+    return base_lr * world_size if getattr(args, 'ddp_scale_lr', False) else base_lr
+
+
+def _ddp_batch_size_v(args, world_size):
+    """Return per-rank velocity batch size; optionally keep global batch close to single-GPU."""
+    batch_size_v = int(args.batch_size_v)
+    if getattr(args, 'ddp_split_batch_size_v', True):
+        return max(1, batch_size_v // max(1, world_size))
+    return batch_size_v
+
+
+def _build_scheduler(args, optimizer, lr, warmup_epochs=None):
+    """Mirror the single-GPU scheduler selection in DDP."""
+    scheduler_type = getattr(args, 'scheduler_type', 'plateau')
+    if scheduler_type == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=getattr(args, 'cosine_T_0', 1000),
+            T_mult=getattr(args, 'cosine_T_mult', 2),
+            eta_min=getattr(args, 'cosine_eta_min', 1e-6),
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=args.factor, patience=args.patience, min_lr=args.min_lr
+        )
+
+    use_warmup = getattr(args, 'use_warmup', False)
+    warmup_scheduler = None
+    if use_warmup:
+        warmup_scheduler = WarmupScheduler(
+            optimizer=optimizer,
+            warmup_epochs=args.warmup_epochs if warmup_epochs is None else warmup_epochs,
+            base_lr=lr,
+            warmup_start_lr=lr / 10.,
+            warmup_strategy="linear",
+            after_scheduler=None
+        )
+
+    return scheduler, warmup_scheduler, scheduler_type, use_warmup
 
 
 def _train_worker(rank, world_size, args):
@@ -82,7 +126,7 @@ def _train_worker(rank, world_size, args):
     )
     dataloader['train'] = DataLoader(
         dataloader['train'].dataset,
-        batch_size=args.batch_size_v,
+        batch_size=_ddp_batch_size_v(args, world_size),
         sampler=train_sampler,
         num_workers=max(1, 4),
         pin_memory=True
@@ -112,29 +156,27 @@ def _train_worker(rank, world_size, args):
     if is_main_process(rank):
         print("模型已包装为 DistributedDataParallel")
 
-    # 加载预训练的 FNO 模型
-    fno = FNO(args).to(device)
-    if args.use_fno_as_label and args.fno_weights_path:
-        fno.load_state_dict(torch.load(args.fno_weights_path, map_location=device)['model_state_dict'])
-        if is_main_process(rank):
-            print(f"已加载 FNO 权重: {args.fno_weights_path}")
-    fno.eval()
+    fno = None
+    if args.use_fno_as_label:
+        fno = FNO(args).to(device)
+        if args.fno_weights_path:
+            fno.load_state_dict(torch.load(args.fno_weights_path, map_location=device)['model_state_dict'])
+            if is_main_process(rank):
+                print(f"已加载 FNO 权重: {args.fno_weights_path}")
+        fno.eval()
 
     # ==========================================
     # 优化器与调度器
     # ==========================================
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr * world_size, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=args.factor, patience=args.patience, min_lr=args.min_lr  * world_size
-    )
-    warmup_scheduler = WarmupScheduler(
-        optimizer=optimizer,
-        warmup_epochs=args.warmup_epochs,
-        base_lr=args.lr * world_size,
-        warmup_start_lr=args.lr  * world_size/ 10.,
-        warmup_strategy="linear",
-        after_scheduler=None
-    )
+    ddp_lr = _ddp_lr(args, args.lr, world_size)
+    optimizer = torch.optim.Adam(model.parameters(), lr=ddp_lr, weight_decay=args.weight_decay)
+    scheduler, warmup_scheduler, scheduler_type, use_warmup = _build_scheduler(args, optimizer, ddp_lr)
+
+    if is_main_process(rank):
+        print(f"DDP per-rank batch_size_v: {_ddp_batch_size_v(args, world_size)} "
+              f"(global≈{_ddp_batch_size_v(args, world_size) * world_size}, single={args.batch_size_v})")
+        print(f"DDP lr: {ddp_lr:.3e} (scale_lr={getattr(args, 'ddp_scale_lr', False)})")
+        print(f"Scheduler: {scheduler_type}" + (f" (warmup {args.warmup_epochs} epochs)" if use_warmup else ""))
 
     # ==========================================
     # 训练状态初始化
@@ -156,6 +198,7 @@ def _train_worker(rank, world_size, args):
     # 主训练循环
     # ==========================================
     optimizer.zero_grad()
+    step_counter = 0
 
     # 只在主进程显示进度条
     if is_main_process(rank):
@@ -245,36 +288,33 @@ def _train_worker(rank, world_size, args):
                 y_combined = torch.cat([y_batch, y_ran], dim=1) if y_ran is not None else y_batch
                 y_combined.requires_grad_(True)
 
-                # 通过 DDP wrapper 调用 forward (触发梯度同步 hook)
-                Delta_U = model(vel_batch, y_combined, UU0_batch, freq_batch=freq_batch)
+                sync_grad = ((step_counter + 1) % args.accumulation_steps == 0)
+                sync_context = nullcontext() if sync_grad else model.no_sync()
 
-                # 计算损失 (不调用 forward)
-                loss, loss_f, loss_u, loss_r, loss_env = model.module.compute_loss(
-                    Delta_U, vel_batch, y_batch, UU0_batch, labels_batch,
-                    y_combined, a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
-                    freq_batch=freq_batch
-                )
+                with sync_context:
+                    Delta_U = model(vel_batch, y_combined, UU0_batch, freq_batch=freq_batch)
 
-                loss = loss / n_coord
+                    loss, loss_f, loss_u, loss_r, loss_env = model.module.compute_loss(
+                        Delta_U, vel_batch, y_batch, UU0_batch, labels_batch,
+                        y_combined, a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                        freq_batch=freq_batch
+                    )
 
-                # 梯度同步策略: 仅最后一个 coord batch 触发 DDP all-reduce
-                if idx < n_coord - 1:
-                    with model.no_sync():
-                        loss.backward()
-                else:
+                    loss = loss / args.accumulation_steps
                     loss.backward()           # all-reduce 在此触发
 
-                batch_loss.append(loss.item() * n_coord)
+                step_counter += 1
+                if step_counter % args.accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                batch_loss.append(loss.item() * args.accumulation_steps)
                 batch_u_loss.append(loss_u.item())
                 batch_f_loss.append(loss_f.item())
                 batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
                 batch_env_loss.append(loss_env.item())
 
                 del loss, loss_f, loss_u, loss_r, loss_env, y_batch, Delta_U
-
-            # 每个 velocity batch 结束后更新参数
-            optimizer.step()
-            optimizer.zero_grad()
 
         # 跨进程平均损失
         avg_loss = np.mean(batch_loss) if batch_loss else 0
@@ -316,8 +356,10 @@ def _train_worker(rank, world_size, args):
             })
 
         # 学习率调度
-        if i <= args.warmup_epochs:
+        if use_warmup and warmup_scheduler is not None and i <= args.warmup_epochs:
             warmup_scheduler.step(i)
+        elif scheduler_type == 'cosine':
+            scheduler.step()
         else:
             scheduler.step(avg_loss)
 
@@ -466,6 +508,9 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
     env_norm_coe = 1.
 
     optimizer.zero_grad()
+    step_counter = 0
+    scheduler_type = getattr(args, 'scheduler_type', 'plateau')
+    use_warmup = getattr(args, 'use_warmup', False)
 
     if is_main_process(rank):
         pbar = tqdm(range(stage_niter), desc=f"Stage {stage_idx} [{stage_name}]", dynamic_ncols=True)
@@ -548,32 +593,33 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
                 y_combined = torch.cat([y_batch, y_ran], dim=1) if y_ran is not None else y_batch
                 y_combined.requires_grad_(True)
 
-                Delta_U = model(vel_batch, y_combined, UU0_batch, freq_batch=freq_batch)
+                sync_grad = ((step_counter + 1) % args.accumulation_steps == 0)
+                sync_context = nullcontext() if sync_grad else model.no_sync()
 
-                loss, loss_f, loss_u, loss_r, loss_env = model.module.compute_loss(
-                    Delta_U, vel_batch, y_batch, UU0_batch, labels_batch,
-                    y_combined, a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
-                    freq_batch=freq_batch
-                )
+                with sync_context:
+                    Delta_U = model(vel_batch, y_combined, UU0_batch, freq_batch=freq_batch)
 
-                loss = loss / n_coord
+                    loss, loss_f, loss_u, loss_r, loss_env = model.module.compute_loss(
+                        Delta_U, vel_batch, y_batch, UU0_batch, labels_batch,
+                        y_combined, a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                        freq_batch=freq_batch
+                    )
 
-                if idx < n_coord - 1:
-                    with model.no_sync():
-                        loss.backward()
-                else:
+                    loss = loss / args.accumulation_steps
                     loss.backward()
 
-                batch_loss.append(loss.item() * n_coord)
+                step_counter += 1
+                if step_counter % args.accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                batch_loss.append(loss.item() * args.accumulation_steps)
                 batch_u_loss.append(loss_u.item())
                 batch_f_loss.append(loss_f.item())
                 batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
                 batch_env_loss.append(loss_env.item())
 
                 del loss, loss_f, loss_u, loss_r, loss_env, y_batch, Delta_U
-
-            optimizer.step()
-            optimizer.zero_grad()
 
         # ---- 跨进程平均损失 ----
         avg_loss = np.mean(batch_loss) if batch_loss else 0
@@ -612,8 +658,10 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
                 'GPU': f"{world_size}"
             })
 
-        if i <= stage_warmup:
+        if use_warmup and warmup_scheduler is not None and i <= stage_warmup:
             warmup_scheduler.step(i)
+        elif scheduler_type == 'cosine':
+            scheduler.step()
         else:
             scheduler.step(avg_loss)
 
@@ -852,7 +900,7 @@ def _train_stage_ddp(args, model, fno, device, rank, world_size,
         )
         dataloader['train'] = DataLoader(
             new_train_ds,
-            batch_size=args.batch_size_v, sampler=replay_sampler, drop_last=True,
+            batch_size=_ddp_batch_size_v(args, world_size), sampler=replay_sampler, drop_last=True,
             pin_memory=pin_mem, num_workers=4, prefetch_factor=2,
         )
 
@@ -866,7 +914,7 @@ def _train_stage_ddp(args, model, fno, device, rank, world_size,
         )
         dataloader['train'] = DataLoader(
             dataloader['train'].dataset,
-            batch_size=args.batch_size_v,
+            batch_size=_ddp_batch_size_v(args, world_size),
             sampler=train_sampler,
             drop_last=True,
             num_workers=4, pin_memory=True, prefetch_factor=2
@@ -878,17 +926,19 @@ def _train_stage_ddp(args, model, fno, device, rank, world_size,
         print(f"已启用 DistributedSampler (world_size={world_size})")
 
     # ---- 4. 初始化优化器与调度器 ----
+    ddp_lr = _ddp_lr(args, stage_lr, world_size)
     optimizer = torch.optim.Adam(
-        model.parameters(), lr=stage_lr * world_size, weight_decay=args.weight_decay
+        model.parameters(), lr=ddp_lr, weight_decay=args.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=args.factor, patience=args.patience,
-        min_lr=args.min_lr * world_size
+    scheduler, warmup_scheduler, scheduler_type, use_warmup = _build_scheduler(
+        args, optimizer, ddp_lr, warmup_epochs=stage_warmup
     )
-    warmup_scheduler = WarmupScheduler(
-        optimizer, warmup_epochs=stage_warmup, base_lr=stage_lr * world_size,
-        warmup_start_lr=stage_lr * world_size / 10., warmup_strategy="linear"
-    )
+
+    if is_main_process(rank):
+        print(f"DDP per-rank batch_size_v: {_ddp_batch_size_v(args, world_size)} "
+              f"(global≈{_ddp_batch_size_v(args, world_size) * world_size}, single={args.batch_size_v})")
+        print(f"DDP lr: {ddp_lr:.3e} (scale_lr={getattr(args, 'ddp_scale_lr', False)})")
+        print(f"Scheduler: {scheduler_type}" + (f" (warmup {stage_warmup} epochs)" if use_warmup else ""))
 
     # ---- 5. 运行训练循环 ----
     model = _run_stage_training_loop(
@@ -923,12 +973,14 @@ def _train_worker_staged(rank, world_size, args):
 
     model = wrap_model_for_distributed(model, rank)
 
-    fno = FNO(args).to(device)
-    if args.use_fno_as_label and args.fno_weights_path:
-        fno.load_state_dict(torch.load(args.fno_weights_path, map_location=device)['model_state_dict'])
-        if is_main_process(rank):
-            print(f"已加载 FNO 权重: {args.fno_weights_path}")
-    fno.eval()
+    fno = None
+    if args.use_fno_as_label:
+        fno = FNO(args).to(device)
+        if args.fno_weights_path:
+            fno.load_state_dict(torch.load(args.fno_weights_path, map_location=device)['model_state_dict'])
+            if is_main_process(rank):
+                print(f"已加载 FNO 权重: {args.fno_weights_path}")
+        fno.eval()
 
     save_doc = args.save_doc
     if is_main_process(rank):
@@ -982,4 +1034,3 @@ def train_distributed_staged(args):
         nprocs=world_size,
         join=True
     )
-

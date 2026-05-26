@@ -591,3 +591,66 @@ class SmoothBlockEncoder(nn.Module):
         
         smooth_feat = smooth_feat.squeeze(-1).permute(0, 2, 1)
         return self.block_mlp(smooth_feat)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(x + self.block(x))
+
+
+class ResNetBranch2d(nn.Module):
+    def __init__(self, in_channels, out_channels, base_width=64):
+        super().__init__()
+        mid = base_width * 2
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, base_width, 3, padding=1),
+            nn.BatchNorm2d(base_width),
+            nn.GELU(),
+        )
+        self.stage1 = nn.Sequential(ResBlock(base_width), ResBlock(base_width))
+        self.expand = nn.Sequential(
+            nn.Conv2d(base_width, mid, 3, padding=1),
+            nn.BatchNorm2d(mid),
+            nn.GELU(),
+        )
+        self.stage2 = nn.Sequential(ResBlock(mid), ResBlock(mid))
+        self.head = nn.Conv2d(mid, out_channels, 3, padding=1)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.expand(x)
+        x = self.stage2(x)
+        return self.head(x)
+
+
+class ConvBranch2d(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 16, 3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.GELU(),
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, out_channels, 3, padding=1),
+        )
+
+    def forward(self, x):
+        return self.net(x)

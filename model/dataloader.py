@@ -21,19 +21,19 @@ def Training_data(args, vel, UU_loc, UU0_loc, freq=None):
     selected_idx_set = set(idx)
     remaining_idx = [i for i in range(len(vel)) if i not in selected_idx_set]
     
-    # 定义波源坐标候选列表
-    source_coords = [
-        [pml_crop//2 + 1, pml_crop//2 + 5], [pml_crop//2 + 1, pml_crop//2 + 20], [pml_crop//2 + 1, pml_crop//2 + 35],
-        [pml_crop//2 + 1, pml_crop//2 + 50], [pml_crop//2 + 1, pml_crop//2 + 65]
-    ]
-    loc_list = args.source_list  # 现在可以包含多个震源，例如 [1, 2, 3]
-    
+    # source_coords 已注释 — 硬编码坐标与实际数据不匹配，待后续从数据中自动检测
+    # source_coords = [
+    #     [pml_crop//2 + 1, pml_crop//2 + 5], [pml_crop//2 + 1, pml_crop//2 + 20], [pml_crop//2 + 1, pml_crop//2 + 35],
+    #     [pml_crop//2 + 1, pml_crop//2 + 50], [pml_crop//2 + 1, pml_crop//2 + 65]
+    # ]
+    loc_list = args.source_list
+
     # --- 核心处理逻辑封装（支持多震源数据拼接） ---
     def process_split(indices, count):
         # 提取当前划分的速度模型基础张量 [count, 1, NZ, NX]
         base_vel = vel[indices[:count], :, :].unsqueeze(1)
 
-        vel_list, u_list, u0_list, labels_list, src_list, freq_list = [], [], [], [], [], []
+        vel_list, u_list, u0_list, labels_list, freq_list = [], [], [], [], []
 
         # 遍历所有被激活的震源
         for loci in loc_list:
@@ -51,13 +51,7 @@ def Training_data(args, vel, UU_loc, UU0_loc, freq=None):
             u0_list.append(u0_current)
             labels_list.append(labels_current)
 
-            # 4. 计算当前 Source 坐标并扩展维度 (适配当前 batch 大小 count)
-            sz, sx = source_coords[loci]
-            # 这里将维度扩展为 [count, 2]，代表这 count 个样本对应同一个震源坐标
-            src_tensor = torch.tensor([sz, sx]).expand(count, -1).float()
-            src_list.append(src_tensor * spatial_step)
-
-            # 5. freq 按震源复制（每个速度模型的 freq 对所有震源相同）
+            # 4. freq 按震源复制（每个速度模型的 freq 对所有震源相同）
             if freq is not None:
                 freq_list.append(freq[indices[:count]])
 
@@ -67,13 +61,12 @@ def Training_data(args, vel, UU_loc, UU0_loc, freq=None):
         u_out = torch.cat(u_list, dim=0)
         u0_out = torch.cat(u0_list, dim=0)
         labels_out = torch.cat(labels_list, dim=0)
-        src_out = torch.cat(src_list, dim=0)
         freq_out = torch.cat(freq_list, dim=0) if freq_list else None
 
-        return vel_out, u_out, u0_out, labels_out, src_out, freq_out
+        return vel_out, u_out, u0_out, labels_out, freq_out
 
     # --- 3. 生成训练集数据 ---
-    vel_train, UU_loc_train, UU0_train, labels, source_train, freq_train = process_split(idx, nvel)
+    vel_train, UU_loc_train, UU0_train, labels, freq_train = process_split(idx, nvel)
     
     # 训练集的坐标点 y_train（所有样本共享一份以节省内存）
     if getattr(args, 'sampling_mode', 'full_grid') == 'halton':
@@ -94,7 +87,7 @@ def Training_data(args, vel, UU_loc, UU0_loc, freq=None):
         y_train = torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1).float() * spatial_step
 
     # --- 4. 生成验证集数据 ---
-    vel_valid, UU_loc_valid, UU0_valid, labels_valid, source_valid, freq_valid = process_split(remaining_idx, valid_num)
+    vel_valid, UU_loc_valid, UU0_valid, labels_valid, freq_valid = process_split(remaining_idx, valid_num)
     y_valid = y_train  # 验证集坐标点与训练集保持一致
 
     return (
@@ -245,10 +238,9 @@ def prepare_training_dataloaders(args, device):
     y_pred = points.float() * args.dh
     y_test = y_pred
 
-    # 6. 构建 DataLoader (添加 num_workers 加速数据加载)
-    pin_mem = device.type == 'cuda'
-    num_workers = 4
-    prefetch_factor = 2
+    # 6. 构建 DataLoader
+    pin_mem = False
+    num_workers = 0
 
     # 构建 DataLoader 时根据 freq 是否存在决定 TensorDataset 内容
     train_ds = (TensorDataset(vel_train, UU0_train, labels_train, freq_train)
@@ -261,20 +253,16 @@ def prepare_training_dataloaders(args, device):
     train_loaders = {
         "train": DataLoader(train_ds,
                             batch_size=args.batch_size_v, shuffle=True, drop_last=True,
-                            pin_memory=pin_mem, num_workers=num_workers, prefetch_factor=prefetch_factor,
-                            persistent_workers=True),
+                            pin_memory=pin_mem, num_workers=num_workers),
         "train_y": DataLoader(TensorDataset(y_train),
                               batch_size=args.batch_size, shuffle=True, pin_memory=pin_mem,
-                              num_workers=num_workers, prefetch_factor=prefetch_factor,
-                              persistent_workers=True),
+                              num_workers=num_workers),
         "valid": DataLoader(valid_ds,
                             batch_size=args.valid_batch_size_v, shuffle=True, drop_last=True,
-                            pin_memory=pin_mem, num_workers=num_workers, prefetch_factor=prefetch_factor,
-                            persistent_workers=True),
+                            pin_memory=pin_mem, num_workers=num_workers),
         "valid_y": DataLoader(TensorDataset(y_valid),
                               batch_size=args.valid_batch_size, shuffle=True, pin_memory=pin_mem,
-                              num_workers=num_workers, prefetch_factor=prefetch_factor,
-                              persistent_workers=True),
+                              num_workers=num_workers),
         "pred": DataLoader(TensorDataset(y_pred), batch_size=args.batch_size, shuffle=False),
         "test": DataLoader(TensorDataset(y_test), batch_size=args.batch_size, shuffle=False)
     }

@@ -17,7 +17,7 @@ class Pi_DeepONet(nn.Module):
         super().__init__()
         self.args = args  # 保存args以便其他方法使用
         self.device = args.device
-        self.feat_dim = 128  # 特征维度，必须能被注意力头数整除
+        self.feat_dim = 256  # 特征维度，必须能被注意力头数整除
 
         # --- 超参数 ---
         input_shape_branch1 = args.input_shape_branch1
@@ -34,9 +34,16 @@ class Pi_DeepONet(nn.Module):
         self.branch1 = nn.Sequential(
             FNO2d(input_shape_branch1[1], self.feat_dim, modes1=12, modes2=12, width=32),
         )
-        self.branch2 = nn.Sequential(
-            FNO2d(input_shape_branch2[1], self.feat_dim, modes1=32, modes2=32, width=32),
-        )
+
+        branch2_type = getattr(args, 'branch2_type', 'fno')
+        if branch2_type == 'resnet':
+            self.branch2 = ResNetBranch2d(input_shape_branch2[1], self.feat_dim, base_width=64)
+        elif branch2_type == 'conv':
+            self.branch2 = ConvBranch2d(input_shape_branch2[1], self.feat_dim)
+        else:
+            self.branch2 = nn.Sequential(
+                FNO2d(input_shape_branch2[1], self.feat_dim, modes1=32, modes2=32, width=32),
+            )
         
         # --- 注意力与特征融合 ---
         self.channel_attention1 = ChannelAttention(self.feat_dim, reduction=8)
