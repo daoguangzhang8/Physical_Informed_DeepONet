@@ -87,9 +87,11 @@ def _train_worker(rank, world_size, args):
         args: 配置参数对象
     """
     # 初始化分布式环境
-    setup_distributed(rank, world_size)
-    device = torch.device(f'cuda:{rank}')
-    args.device = rank  # 确保绘图等函数使用正确的 GPU
+    selected_gpus = getattr(args, 'selected_gpus', list(range(world_size)))
+    local_device = selected_gpus[rank]
+    setup_distributed(rank, world_size, local_device=local_device)
+    device = torch.device(f'cuda:{local_device}')
+    args.device = local_device  # 确保绘图等函数使用正确的 GPU
 
     if is_main_process(rank):
         print("=" * 60)
@@ -152,7 +154,7 @@ def _train_worker(rank, world_size, args):
         dist.broadcast(param.data, src=0)
 
     # 包装模型为 DDP
-    model = wrap_model_for_distributed(model, rank)
+    model = wrap_model_for_distributed(model, rank, device_id=local_device)
     if is_main_process(rank):
         print("模型已包装为 DistributedDataParallel")
 
@@ -446,6 +448,10 @@ def _train_worker(rank, world_size, args):
             np.save(os.path.join(args.save_doc, 'loss_pde_log.npy'), loss_pde_log)
             np.save(os.path.join(args.save_doc, 'loss_env_log.npy'), loss_env_log)
 
+        # rank 0 会执行验证、画图和保存；其他 rank 必须等待，否则下一轮 DDP
+        # forward/backward 会和 rank 0 的非 DDP 评估流程错位。
+        dist.barrier()
+
     # ==========================================
     # 最终保存与清理
     # ==========================================
@@ -737,6 +743,9 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
             np.save(os.path.join(save_doc, f'loss_pde_log_stage{stage_idx}.npy'), loss_pde_log)
             np.save(os.path.join(save_doc, f'loss_env_log_stage{stage_idx}.npy'), loss_env_log)
 
+        # rank 0 阶段验证/画图/保存期间，其他 rank 等待，避免 DDP collective 错位。
+        dist.barrier()
+
     # ---- 阶段结束：保存最终权重 ----
     if is_main_process(rank):
         final_path = os.path.join(save_doc, f'{args.filename}_stage{stage_idx}_final_weights_{args.nz}.pth')
@@ -957,9 +966,11 @@ def _train_stage_ddp(args, model, fno, device, rank, world_size,
 
 def _train_worker_staged(rank, world_size, args):
     """分布式课程学习训练工作进程，在单个 mp.spawn 生命周期内依次执行所有阶段"""
-    setup_distributed(rank, world_size)
-    device = torch.device(f'cuda:{rank}')
-    args.device = rank
+    selected_gpus = getattr(args, 'selected_gpus', list(range(world_size)))
+    local_device = selected_gpus[rank]
+    setup_distributed(rank, world_size, local_device=local_device)
+    device = torch.device(f'cuda:{local_device}')
+    args.device = local_device
 
     # 创建模型（全局一次，跨阶段复用）
     model = Pi_DeepONet(args).to(device)
@@ -971,7 +982,7 @@ def _train_worker_staged(rank, world_size, args):
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
 
-    model = wrap_model_for_distributed(model, rank)
+    model = wrap_model_for_distributed(model, rank, device_id=local_device)
 
     fno = None
     if args.use_fno_as_label:

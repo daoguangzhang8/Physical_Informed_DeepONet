@@ -12,8 +12,11 @@ Usage:
 import argparse
 import os
 import re
+import glob
 import numpy as np
 import torch
+os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib')
+os.environ.setdefault('XDG_CACHE_HOME', '/tmp')
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -24,6 +27,11 @@ from model.PI_DeepOnet import Pi_DeepONet
 from model.FNO import FNO
 from model.plotting import calculate_regression_metrics, fine_tuning
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DATA_ROOT = os.environ.get('PIDEEPONET_DATA_ROOT', '/home/sharedata/zdg')
+DEFAULT_TEST_DATA_DIR = os.path.join(DEFAULT_DATA_ROOT, 'external_test')
+DEFAULT_WEIGHTS_DIR = os.path.join(PROJECT_ROOT, 'output_cnn1')
+
 
 # =====================================================================
 # 命令行参数
@@ -31,7 +39,7 @@ from model.plotting import calculate_regression_metrics, fine_tuning
 def parse_cli():
     p = argparse.ArgumentParser(description='PI-DeepONet 外部测试集评估')
     p.add_argument('--dataset', type=str, default='marmousi',
-                   choices=['marmousi', 'overthrust', 'random'],
+                   choices=['marmousi', 'overthrust', 'random', 'marmousi_alt'],
                    help='测试数据集名称 (默认 marmousi)')
     p.add_argument('--sources', type=str, default='2',
                    help='震源索引, 逗号分隔 (默认 "2")')
@@ -39,6 +47,10 @@ def parse_cli():
                    help='测试频率, 逗号分隔 (默认 "5,10,15,20,25")')
     p.add_argument('--weights', type=str, default=None,
                    help='模型权重路径')
+    p.add_argument('--data-dir', type=str, default=None,
+                   help='外部测试数据目录 (默认 /home/sharedata/zdg/external_test)')
+    p.add_argument('--weights-dir', type=str, default=None,
+                   help='未指定 --weights 时自动查找权重的目录 (默认 output_cnn1)')
     p.add_argument('--device', type=int, default=None,
                    help='GPU 编号')
     p.add_argument('--finetune', action='store_true',
@@ -55,13 +67,13 @@ class ArgsTest:
     # ==========================================
     # 1. 路径与文件配置 (Paths & I/O)
     # ==========================================
-    load_path = '/home/sharedata/zdg'         # 测试数据根目录
-    weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
+    load_path = DEFAULT_DATA_ROOT             # 测试数据根目录
+    weights_save_path = PROJECT_ROOT          # 模型权重保存根目录
     save_doc = 'output_test'                  # 结果输出文件夹名称 (会被 CLI --output 覆盖)
     filename = 'PI_DeepONet_pde'             # 保存的模型前缀名称
 
     # 测试数据路径
-    test_data_dir = '/home/sharedata/zdg/external_test'  # 外部测试数据目录
+    test_data_dir = DEFAULT_TEST_DATA_DIR     # 外部测试数据目录
 
     # ==========================================
     # 2. 硬件与设备配置 (Hardware & Device)
@@ -94,7 +106,7 @@ class ArgsTest:
     # 5. 模型权重配置 (Model Weights)
     # ==========================================
     model_weights_path = ''                   # 模型权重路径 (会被 CLI --weights 覆盖)
-
+    trained_weights_dir = DEFAULT_WEIGHTS_DIR # 未指定权重时，从该目录自动选择最新权重
     # ==========================================
     # 5.5 网络架构 (Architecture)
     # ==========================================
@@ -151,15 +163,113 @@ class ArgsTest:
         if cli_args.finetune:
             self.if_finetune = True
         if cli_args.weights:
-            self.model_weights_path = cli_args.weights
+            self.model_weights_path = resolve_path(cli_args.weights, PROJECT_ROOT)
+        if cli_args.data_dir:
+            self.test_data_dir = resolve_path(cli_args.data_dir, PROJECT_ROOT)
+        if cli_args.weights_dir:
+            self.trained_weights_dir = resolve_path(cli_args.weights_dir, PROJECT_ROOT)
         if cli_args.output:
-            self.save_doc = cli_args.output
+            self.save_doc = resolve_path(cli_args.output, PROJECT_ROOT)
         else:
-            self.save_doc = f'output_test_{cli_args.dataset}'
+            self.save_doc = os.path.join(PROJECT_ROOT, f'output_test_{cli_args.dataset}')
 
         self._cli = cli_args
         self._source_list = [int(s) for s in cli_args.sources.split(',')]
         self._freq_list = [float(f) for f in cli_args.freqs.split(',')]
+        self.source_list = self._source_list
+        self.freq_list = self._freq_list
+
+
+def resolve_path(path, base_dir):
+    """把用户传入的相对路径解析为项目内路径，绝对路径保持不变。"""
+    if not path:
+        return path
+    path = os.path.expanduser(path)
+    return path if os.path.isabs(path) else os.path.join(base_dir, path)
+
+
+def refresh_model_shapes(args):
+    """外部数据 PML 裁切后，刷新网络构建所需的 shape 占位。"""
+    args.input_shape_trunk = (args.batch_size, args.in_channels, 1, 2)
+    args.input_shape_branch1 = (args.batch_size, args.in_channels_vel, args.nz, args.nx)
+    args.input_shape_branch2 = (args.batch_size, args.in_channels, args.nz, args.nx)
+
+
+def find_latest_weight(args):
+    """未显式指定 --weights 时，从默认训练输出目录选择 epoch 最大的权重。"""
+    weights_dir = resolve_path(getattr(args, 'trained_weights_dir', ''), PROJECT_ROOT)
+    pattern = os.path.join(weights_dir, f'{args.filename}_PI_model_*epoch_weights_*.pth')
+    candidates = glob.glob(pattern)
+    if not candidates:
+        return ''
+
+    def epoch_of(path):
+        match = re.search(r'(\d+)epoch', os.path.basename(path))
+        return int(match.group(1)) if match else -1
+
+    return max(candidates, key=epoch_of)
+
+
+def resolve_model_path(args):
+    """解析显式权重路径；未指定时自动查找最新权重。"""
+    model_path = getattr(args, 'model_weights_path', None)
+    if model_path:
+        return model_path
+
+    model_path = find_latest_weight(args)
+    if model_path:
+        args.model_weights_path = model_path
+        print(f'[*] 未指定 --weights，自动使用最新权重: {model_path}')
+        return model_path
+
+    raise ValueError(
+        '未指定权重路径，且自动查找失败。请使用 --weights 指定权重，'
+        f'或把权重放到 {args.trained_weights_dir}'
+    )
+
+
+def checkpoint_state_dict(model_path, device):
+    ckpt = torch.load(model_path, map_location=device)
+    return ckpt.get('model_state_dict', ckpt)
+
+
+def infer_branch2_type_from_checkpoint(model_path, device):
+    """根据 checkpoint key 自动识别 branch2 架构，兼容旧实验输出目录。"""
+    state_dict = checkpoint_state_dict(model_path, device)
+    keys = [key.replace('module.', '', 1) for key in state_dict.keys()]
+    if any(key.startswith('branch2.0.fc0.') for key in keys):
+        return 'fno'
+    if any(key.startswith('branch2.net.') for key in keys):
+        return 'conv'
+    if any(key.startswith('branch2.stem.') or key.startswith('branch2.blocks.') for key in keys):
+        return 'resnet'
+    return None
+
+
+def load_model_checkpoint(model, model_path, device):
+    """兼容单卡与 DDP 保存的 checkpoint/state_dict。"""
+    ckpt = torch.load(model_path, map_location=device)
+    state_dict = ckpt.get('model_state_dict', ckpt)
+    if any(key.startswith('module.') for key in state_dict):
+        state_dict = {key.replace('module.', '', 1): value for key, value in state_dict.items()}
+    model.load_state_dict(state_dict)
+    return ckpt
+
+
+def select_eval_device(args):
+    """选择可用的评估设备，并避免默认 GPU 编号在新机器上越界。"""
+    if not torch.cuda.is_available():
+        args.device = torch.device('cpu')
+        return args.device
+
+    requested = args.device if isinstance(args.device, int) else 0
+    gpu_count = torch.cuda.device_count()
+    if requested < 0 or requested >= gpu_count:
+        print(f'⚠️ 请求的 GPU cuda:{requested} 不存在，自动改用 cuda:0')
+        requested = 0
+
+    args.device = torch.device(f'cuda:{requested}')
+    return args.device
 
 
 # =====================================================================
@@ -182,6 +292,18 @@ def load_test_data(args):
     source_list = args._source_list
     freq_list = args._freq_list
     data_dir = args.test_data_dir
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(f'外部测试数据目录不存在: {data_dir}')
+
+    required_files = [
+        os.path.join(data_dir, f'{name}_velocity.npy'),
+        os.path.join(data_dir, f'{name}_wavefield.npy'),
+        os.path.join(data_dir, f'{name}_background.npy'),
+        os.path.join(data_dir, f'{name}_freq_used.npy'),
+    ]
+    missing = [path for path in required_files if not os.path.exists(path)]
+    if missing:
+        raise FileNotFoundError('外部测试数据文件缺失:\n' + '\n'.join(missing))
 
     vel = np.load(os.path.join(data_dir, f'{name}_velocity.npy'))
     wf = np.load(os.path.join(data_dir, f'{name}_wavefield.npy'))
@@ -195,6 +317,7 @@ def load_test_data(args):
 
     print(f'[*] 数据集: {name}')
     print(f'    原始维度: vel={vel.shape}, wf={wf.shape}, freq={freq_all.shape}')
+    print(f'    数据目录: {data_dir}')
     print(f'    包含频率: {freq_unique}')
 
     # --- PML 裁切 (与训练逻辑一致) ---
@@ -303,16 +426,108 @@ def evaluate_single(args, model, vel, UU0, label, freq_val, device):
     return pred_2d, m_r, m_i
 
 
+def _crop_entry(entry, args):
+    """对单个 entry 做 PML active 裁切，返回 (vel_crop, true_crop, pred_crop)。"""
+    L = args.pml_active
+    z_sl = slice(0, -L) if args.boundary_type == 'free_surface' and L > 0 else (
+        slice(L, -L) if L > 0 else slice(None))
+    x_sl = slice(L, -L) if L > 0 else slice(None)
+
+    vel_crop = entry['vel'][z_sl, x_sl] * 1000
+    true_crop = entry['true'][z_sl, x_sl, :]
+    pred_crop = entry['pred'][z_sl, x_sl, :]
+    return vel_crop, true_crop, pred_crop
+
+
+def _group_by_velocity(results):
+    """按速度模型内容分组，返回 [(group_id, [entries])]。"""
+    from collections import OrderedDict, defaultdict
+
+    groups = OrderedDict()
+    grouped = defaultdict(list)
+    for entry in results:
+        key = entry['vel'].tobytes()
+        if key not in groups:
+            groups[key] = len(groups)
+        grouped[groups[key]].append(entry)
+    return sorted(grouped.items())
+
+
+def _plot_random_by_model(args, dataset_name, results, epoch_num):
+    """random 数据集按速度模型分组，每个模型分别保存 REAL/IMAG 图。"""
+    groups = _group_by_velocity(results)
+
+    for model_idx, entries in groups:
+        entries_sorted = sorted(entries, key=lambda e: (e['source'], e['freq']))
+
+        for part_idx, suffix in enumerate(['REAL', 'IMAG']):
+            n = len(entries_sorted)
+            fig, axes = plt.subplots(4, n, figsize=(4.2 * n, 14))
+            if n == 1:
+                axes = axes[:, np.newaxis]
+
+            src_list = sorted({entry['source'] for entry in entries_sorted})
+            fig.suptitle(
+                f'{dataset_name} Model {model_idx} src{src_list} {suffix} | Epoch {epoch_num}',
+                fontsize=14)
+
+            for col, entry in enumerate(entries_sorted):
+                vel_crop, true_crop, pred_crop = _crop_entry(entry, args)
+                true_part = true_crop[:, :, part_idx]
+                pred_part = pred_crop[:, :, part_idx]
+                err_part = true_part - pred_part
+                metrics = entry['metrics_real'] if part_idx == 0 else entry['metrics_imag']
+
+                im = axes[0, col].imshow(vel_crop, cmap='jet', aspect='equal')
+                axes[0, col].set_title(
+                    f'src{entry["source"]}_{entry["freq"]:.0f}Hz\nVelocity', fontsize=9)
+                axes[0, col].axis('off')
+                fig.colorbar(im, ax=axes[0, col], fraction=0.046)
+
+                vm = max(np.abs(true_part).max(), 1e-12)
+                em = max(np.abs(err_part).max(), 1e-12)
+
+                im = axes[1, col].imshow(
+                    true_part, cmap='seismic', vmin=-vm, vmax=vm, aspect='equal')
+                axes[1, col].set_title(f'True R²={metrics["r2"]:.4f}', fontsize=9)
+                axes[1, col].axis('off')
+                fig.colorbar(im, ax=axes[1, col], fraction=0.046)
+
+                im = axes[2, col].imshow(
+                    pred_part, cmap='seismic', vmin=-vm, vmax=vm, aspect='equal')
+                axes[2, col].set_title('Pred', fontsize=9)
+                axes[2, col].axis('off')
+                fig.colorbar(im, ax=axes[2, col], fraction=0.046)
+
+                im = axes[3, col].imshow(
+                    err_part, cmap='bwr', vmin=-em, vmax=em, aspect='equal')
+                axes[3, col].set_title(f'Error MSE={metrics["mse"]:.2e}', fontsize=9)
+                axes[3, col].axis('off')
+                fig.colorbar(im, ax=axes[3, col], fraction=0.046)
+
+            fig.tight_layout(rect=[0, 0.03, 1, 0.94])
+            path = os.path.join(
+                args.save_doc,
+                f'{dataset_name}_model{model_idx}_{suffix}_epoch_{epoch_num}.png')
+            fig.savefig(path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f'  已保存 {path}')
+
+
 def plot_results(args, dataset_name, results, epoch_num):
-    """绘制评估结果图。每个子图: True / Pred / Error × (real, imag)。"""
+    """绘制评估结果图。增加速度模型显示，并支持 random 数据集多图保存。"""
     n = len(results)
     if n == 0:
         return
 
     os.makedirs(args.save_doc, exist_ok=True)
 
-    fig_r, ax_r = plt.subplots(3, n, figsize=(4.2 * n, 11))
-    fig_i, ax_i = plt.subplots(3, n, figsize=(4.2 * n, 11))
+    if args._cli.dataset == 'random':
+        _plot_random_by_model(args, dataset_name, results, epoch_num)
+        return
+
+    fig_r, ax_r = plt.subplots(4, n, figsize=(4.2 * n, 14))
+    fig_i, ax_i = plt.subplots(4, n, figsize=(4.2 * n, 14))
     if n == 1:
         ax_r, ax_i = ax_r[:, np.newaxis], ax_i[:, np.newaxis]
 
@@ -322,42 +537,40 @@ def plot_results(args, dataset_name, results, epoch_num):
     for col, entry in enumerate(results):
         src = entry['source']
         freq = entry['freq']
-        true = entry['true']
-        pred = entry['pred']
         m_r, m_i = entry['metrics_real'], entry['metrics_imag']
         tag = f'src{src}_{freq:.0f}Hz'
 
-        # PML active crop for display
-        L = args.pml_active
-        z_sl = slice(0, -L) if args.boundary_type == 'free_surface' and L > 0 else (
-            slice(L, -L) if L > 0 else slice(None))
-        x_sl = slice(L, -L) if L > 0 else slice(None)
-
-        t_r, p_r = true[z_sl, x_sl, 0], pred[z_sl, x_sl, 0]
-        t_i, p_i = true[z_sl, x_sl, 1], pred[z_sl, x_sl, 1]
+        vel_crop, true_crop, pred_crop = _crop_entry(entry, args)
+        t_r, p_r = true_crop[:, :, 0], pred_crop[:, :, 0]
+        t_i, p_i = true_crop[:, :, 1], pred_crop[:, :, 1]
         e_r, e_i = t_r - p_r, t_i - p_i
 
         for (fig, axes, t, p, e, m, part) in [
             (fig_r, ax_r, t_r, p_r, e_r, m_r, 'real'),
             (fig_i, ax_i, t_i, p_i, e_i, m_i, 'imag'),
         ]:
-            vm = max(np.abs(t).max(), 1e-12)
-            em = max(np.abs(e).max(), 1e-12)
-
-            im = axes[0, col].imshow(t, cmap='seismic', vmin=-vm, vmax=vm, aspect='equal')
-            axes[0, col].set_title(f'{tag}\nTrue {part} R²={m["r2"]:.4f}', fontsize=9)
+            im = axes[0, col].imshow(vel_crop, cmap='jet', aspect='equal')
+            axes[0, col].set_title(f'{tag}\nVelocity', fontsize=9)
             axes[0, col].axis('off')
             fig.colorbar(im, ax=axes[0, col], fraction=0.046)
 
-            im = axes[1, col].imshow(p, cmap='seismic', vmin=-vm, vmax=vm, aspect='equal')
-            axes[1, col].set_title(f'Pred {part}', fontsize=9)
+            vm = max(np.abs(t).max(), 1e-12)
+            em = max(np.abs(e).max(), 1e-12)
+
+            im = axes[1, col].imshow(t, cmap='seismic', vmin=-vm, vmax=vm, aspect='equal')
+            axes[1, col].set_title(f'True {part} R²={m["r2"]:.4f}', fontsize=9)
             axes[1, col].axis('off')
             fig.colorbar(im, ax=axes[1, col], fraction=0.046)
 
-            im = axes[2, col].imshow(e, cmap='bwr', vmin=-em, vmax=em, aspect='equal')
-            axes[2, col].set_title(f'Error MSE={m["mse"]:.2e}', fontsize=9)
+            im = axes[2, col].imshow(p, cmap='seismic', vmin=-vm, vmax=vm, aspect='equal')
+            axes[2, col].set_title(f'Pred {part}', fontsize=9)
             axes[2, col].axis('off')
             fig.colorbar(im, ax=axes[2, col], fraction=0.046)
+
+            im = axes[3, col].imshow(e, cmap='bwr', vmin=-em, vmax=em, aspect='equal')
+            axes[3, col].set_title(f'Error MSE={m["mse"]:.2e}', fontsize=9)
+            axes[3, col].axis('off')
+            fig.colorbar(im, ax=axes[3, col], fraction=0.046)
 
     for fig, suffix in [(fig_r, 'REAL'), (fig_i, 'IMAG')]:
         fig.tight_layout(rect=[0, 0.03, 1, 0.94])
@@ -371,7 +584,7 @@ def plot_results(args, dataset_name, results, epoch_num):
 # 主测试流程
 # =====================================================================
 def test(args):
-    device = torch.device(f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu')
+    device = select_eval_device(args)
     print(f'\n{"="*60}')
     print(f'PI-DeepONet 外部测试评估 | 设备: {device}')
     print(f'数据集: {args._cli.dataset}  震源: {args._source_list}  频率: {args._freq_list}')
@@ -381,8 +594,9 @@ def test(args):
 
     # ---- 1. 加载测试数据 ----
     data = load_test_data(args)
+    refresh_model_shapes(args)
     vel = data['vel'] / 1000.0          # 归一化, 与训练一致
-    vel = vel.unsqueeze(1)              # (N, nz, nx) -> (N, 1, nz, nx)
+    vel = vel.unsqueeze(1)
     wf = data['wavefield']
     bg = data['background']
     freq = data['freq']
@@ -390,18 +604,20 @@ def test(args):
     n_sources = data['n_sources']
 
     # ---- 2. 加载模型 ----
+    model_path = resolve_model_path(args)
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f'权重文件不存在: {model_path}')
+
+    inferred_branch2 = infer_branch2_type_from_checkpoint(model_path, device)
+    if inferred_branch2 and inferred_branch2 != getattr(args, 'branch2_type', None):
+        print(f'[*] 根据权重自动切换 branch2_type: {args.branch2_type} -> {inferred_branch2}')
+        args.branch2_type = inferred_branch2
+
     model = Pi_DeepONet(args).to(device)
     fno = FNO(args).to(device)
     fno.eval()
 
-    model_path = getattr(args, 'model_weights_path', None)
-    if not model_path:
-        raise ValueError('未指定权重路径，请使用 --weights 或在 config.py 中设置 model_weights_path')
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f'权重文件不存在: {model_path}')
-
-    ckpt = torch.load(model_path, map_location=device)
-    model.load_state_dict(ckpt['model_state_dict'])
+    load_model_checkpoint(model, model_path, device)
     model.eval()
     epoch_match = re.search(r'(\d+)epoch', model_path)
     epoch_num = int(epoch_match.group(1)) if epoch_match else 0
@@ -411,9 +627,8 @@ def test(args):
     if args.if_finetune:
         print(f'\n[!] 域适应微调...')
         labels = wf - bg
-        vel_ft = vel[:n_samples].unsqueeze(1).to(device)
-        # 复制 vel 以匹配 source 数量
-        vel_ft = vel_ft.expand(n_sources * n_samples, -1, -1, -1).to(device)
+        # 复制速度场以匹配 source-major 排列: [src0 samples, src1 samples, ...]
+        vel_ft = vel.repeat(n_sources, 1, 1, 1).to(device)
         bg_ft = bg.to(device)
         lab_ft = labels.to(device)
         freq_ft = freq.to(device)
@@ -441,10 +656,9 @@ def test(args):
             idx = si * n_samples + fi  # source-major 布局中的索引
             freq_val = freq[idx].item()
 
-            vel_i = vel[idx].unsqueeze(0)                 # (1, 1, nz, nx)
             bg_i = bg[idx]                                 # (2, nz, nx)
             label_i = wf[idx] - bg[idx]                    # (2, nz, nx)
-            vel_single = vel[:n_samples][fi].unsqueeze(0)  # 取第一个 source 对应的 vel
+            vel_single = vel[fi].unsqueeze(0)              # (1, 1, nz, nx)
 
             pred_2d, m_r, m_i = evaluate_single(
                 args, model, vel_single, bg_i.unsqueeze(0), label_i, freq_val, device)
@@ -452,6 +666,7 @@ def test(args):
             results.append({
                 'source': src,
                 'freq': freq_val,
+                'vel': vel_single[0, 0].cpu().numpy(),
                 'true': label_i.numpy().transpose(1, 2, 0),  # (nz, nx, 2)
                 'pred': pred_2d,
                 'metrics_real': m_r,
@@ -480,8 +695,11 @@ def main():
     args = ArgsTest(cli)
 
     if torch.cuda.is_available():
-        mem = torch.cuda.get_device_properties(args.device).total_memory / (1024**3)
-        print(f'GPU: {torch.cuda.get_device_name(args.device)} ({mem:.1f}GB)')
+        requested = args.device if isinstance(args.device, int) else 0
+        if requested < 0 or requested >= torch.cuda.device_count():
+            requested = 0
+        mem = torch.cuda.get_device_properties(requested).total_memory / (1024**3)
+        print(f'GPU: {torch.cuda.get_device_name(requested)} ({mem:.1f}GB)')
 
     test(args)
 

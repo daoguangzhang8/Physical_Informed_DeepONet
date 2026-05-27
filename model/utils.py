@@ -109,7 +109,7 @@ def count_parameters(model):
 # 单机多卡并行训练工具函数 (Single-Machine Multi-GPU)
 # ==========================================
 
-def setup_distributed(rank, world_size):
+def setup_distributed(rank, world_size, local_device=None):
     """
     初始化单机多卡分布式训练环境
 
@@ -124,9 +124,11 @@ def setup_distributed(rank, world_size):
     dist.init_process_group('nccl', rank=rank, world_size=world_size)
 
     # 设置当前设备
-    torch.cuda.set_device(rank)
+    if local_device is None:
+        local_device = rank
+    torch.cuda.set_device(local_device)
 
-    print(f"[Rank {rank}] 单机多卡训练环境初始化完成 | GPU: {rank}/{world_size}")
+    print(f"[Rank {rank}] 单机多卡训练环境初始化完成 | GPU: {local_device} ({rank}/{world_size})")
 
 
 def cleanup_distributed():
@@ -266,7 +268,7 @@ def select_gpus_for_training(args):
     return selected_gpus, world_size
 
 
-def wrap_model_for_distributed(model, rank):
+def wrap_model_for_distributed(model, rank, device_id=None):
     """
     将模型包装为分布式并行模型 (DDP)
 
@@ -279,8 +281,10 @@ def wrap_model_for_distributed(model, rank):
     """
     import torch.nn.parallel.distributed as DDP
 
-    model = model.to(rank)
-    model = DDP.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=False)
+    if device_id is None:
+        device_id = rank
+    model = model.to(device_id)
+    model = DDP.DistributedDataParallel(model, device_ids=[device_id], find_unused_parameters=False)
 
     return model
 
@@ -686,4 +690,3 @@ def sample_shared_y_ran_from_epoch_prob(
         y_shared = torch.cat([y_shared, y_extra], dim=0)
 
     return y_shared
-

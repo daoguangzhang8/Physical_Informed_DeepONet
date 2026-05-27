@@ -27,7 +27,7 @@ class Pi_DeepONet(nn.Module):
         # --- 编码器与特征提取 ---
         self.pos_encoder = PositionalEncoding(embed_dim=4, max_scale=args.pe_max_scale)
         self.kpe = WavenumberPE(embed_dim=4)
-        self.kpe_alpha = nn.Parameter(torch.tensor(0.0))  # 初始化为 0，训练开始等价原模型
+        self.kpe_alpha = nn.Parameter(torch.tensor(0.0), requires_grad=False)  # KPE 当前未接入 forward
         # self.fencoder = FourierFeatureEncoder(input_dim=2, mapping_size=self.feat_dim)  # 未使用，已注释
 
         # --- 网络分支 (Branch) ---

@@ -43,6 +43,7 @@ def main():
         else:
             print(f"✅ 检测到 {len(available_gpus)} 个可用 GPU: {available_gpus[:num_gpus]}")
             print("=" * 60)
+            args.selected_gpus = available_gpus[:num_gpus]
 
             if use_staged:
                 from model.train_distributed import train_distributed_staged
