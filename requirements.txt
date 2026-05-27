@@ -1,17 +1,25 @@
 # Physics-Informed DeepONet
-# Python == 3.12.7
-# CUDA 12.8 (nvidia-cu12 series)
+#
+# Recommended runtime used by this project:
+#   Python 3.10
+#   CUDA 12.x
+#
+# Install PyTorch with the CUDA build that matches your machine first.
+# Example:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
 
-# Deep Learning (已随conda环境安装)
-# torch==2.8.0
-
-# Scientific Computing (已随conda环境安装)
-# numpy==2.0.2
-# scipy==1.13.1
-
-# Visualization (已随conda环境安装)
-# matplotlib==3.9.4
-
-# ---------- 以下需要额外安装 ----------
+# Core training / evaluation
+torch>=2.0
+numpy>=2.0
+scipy>=1.13
+matplotlib>=3.9
 h5py>=3.8
 tqdm>=4.60
+
+# Data generation scripts in data_generation/ use scipy sparse solvers,
+# scipy.io, scipy.ndimage, numpy, and matplotlib; they are covered above.
+
+# Optional legacy script:
+#   PML_qSNN_VQ_freesurface.py depends on TensorFlow v1-style APIs.
+#   Keep it out of the default environment unless that script is needed.
+# tensorflow>=2.10

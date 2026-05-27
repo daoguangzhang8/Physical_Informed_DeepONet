@@ -26,6 +26,7 @@ from model.utils import (
     reduce_tensor,
     build_epoch_velocity_gradient_prob,
     sample_shared_y_ran_from_epoch_prob,
+    ddp_world_size_from_args,
 )
 from model.dataloader import prepare_training_dataloaders, prepare_external_val_dataset
 from model.PI_DeepOnet import Pi_DeepONet
@@ -45,6 +46,23 @@ def _ddp_batch_size_v(args, world_size):
     if getattr(args, 'ddp_split_batch_size_v', True):
         return max(1, batch_size_v // max(1, world_size))
     return batch_size_v
+
+
+def _ddp_num_workers(args):
+    """Per-rank DataLoader workers. Keep modest for 8-16 GPU jobs."""
+    return int(getattr(args, 'ddp_num_workers', 2))
+
+
+def _log_ddp_batch_plan(args, world_size, rank):
+    if not is_main_process(rank):
+        return
+    per_rank = _ddp_batch_size_v(args, world_size)
+    global_batch = per_rank * world_size
+    print(f"DDP per-rank batch_size_v: {per_rank} "
+          f"(global≈{global_batch}, configured single/global target={args.batch_size_v})")
+    if getattr(args, 'ddp_split_batch_size_v', True) and global_batch != int(args.batch_size_v):
+        print(f"⚠️ batch_size_v={args.batch_size_v} 不能被 world_size={world_size} 整除，"
+              f"实际 global batch 将变为 {global_batch}")
 
 
 def _build_scheduler(args, optimizer, lr, warmup_epochs=None):
@@ -88,6 +106,8 @@ def _train_worker(rank, world_size, args):
     """
     # 初始化分布式环境
     selected_gpus = getattr(args, 'selected_gpus', list(range(world_size)))
+    if len(selected_gpus) != world_size:
+        raise ValueError(f"selected_gpus 数量 {len(selected_gpus)} 与 world_size {world_size} 不一致")
     local_device = selected_gpus[rank]
     setup_distributed(rank, world_size, local_device=local_device)
     device = torch.device(f'cuda:{local_device}')
@@ -98,6 +118,8 @@ def _train_worker(rank, world_size, args):
         print(f"单机多卡分布式训练模式")
         print(f"GPU 数量: {world_size}")
         print(f"=" * 60)
+        os.makedirs(args.save_doc, exist_ok=True)
+    dist.barrier()
 
     # ==========================================
     # 加载数据
@@ -130,7 +152,7 @@ def _train_worker(rank, world_size, args):
         dataloader['train'].dataset,
         batch_size=_ddp_batch_size_v(args, world_size),
         sampler=train_sampler,
-        num_workers=max(1, 4),
+        num_workers=_ddp_num_workers(args),
         pin_memory=True
     )
 
@@ -175,8 +197,7 @@ def _train_worker(rank, world_size, args):
     scheduler, warmup_scheduler, scheduler_type, use_warmup = _build_scheduler(args, optimizer, ddp_lr)
 
     if is_main_process(rank):
-        print(f"DDP per-rank batch_size_v: {_ddp_batch_size_v(args, world_size)} "
-              f"(global≈{_ddp_batch_size_v(args, world_size) * world_size}, single={args.batch_size_v})")
+        _log_ddp_batch_plan(args, world_size, rank)
         print(f"DDP lr: {ddp_lr:.3e} (scale_lr={getattr(args, 'ddp_scale_lr', False)})")
         print(f"Scheduler: {scheduler_type}" + (f" (warmup {args.warmup_epochs} epochs)" if use_warmup else ""))
 
@@ -476,11 +497,13 @@ def train_distributed(args):
     Args:
         args: 配置参数对象 (config.Args)
     """
-    world_size = getattr(args, 'num_gpus', 1)
+    world_size = ddp_world_size_from_args(args)
+    args.num_gpus = world_size
 
     print("=" * 60)
     print(f"启动单机多卡分布式训练")
     print(f"GPU 数量: {world_size}")
+    print(f"GPU 列表: {getattr(args, 'selected_gpus', list(range(world_size)))}")
     print("=" * 60)
 
     # 使用 mp.spawn 启动多进程
@@ -910,7 +933,7 @@ def _train_stage_ddp(args, model, fno, device, rank, world_size,
         dataloader['train'] = DataLoader(
             new_train_ds,
             batch_size=_ddp_batch_size_v(args, world_size), sampler=replay_sampler, drop_last=True,
-            pin_memory=pin_mem, num_workers=4, prefetch_factor=2,
+            pin_memory=pin_mem, num_workers=_ddp_num_workers(args), prefetch_factor=2,
         )
 
         if is_main_process(rank):
@@ -926,7 +949,7 @@ def _train_stage_ddp(args, model, fno, device, rank, world_size,
             batch_size=_ddp_batch_size_v(args, world_size),
             sampler=train_sampler,
             drop_last=True,
-            num_workers=4, pin_memory=True, prefetch_factor=2
+            num_workers=_ddp_num_workers(args), pin_memory=True, prefetch_factor=2
         )
 
     has_freq = len(dataloader['train'].dataset.tensors) >= 4
@@ -944,8 +967,7 @@ def _train_stage_ddp(args, model, fno, device, rank, world_size,
     )
 
     if is_main_process(rank):
-        print(f"DDP per-rank batch_size_v: {_ddp_batch_size_v(args, world_size)} "
-              f"(global≈{_ddp_batch_size_v(args, world_size) * world_size}, single={args.batch_size_v})")
+        _log_ddp_batch_plan(args, world_size, rank)
         print(f"DDP lr: {ddp_lr:.3e} (scale_lr={getattr(args, 'ddp_scale_lr', False)})")
         print(f"Scheduler: {scheduler_type}" + (f" (warmup {stage_warmup} epochs)" if use_warmup else ""))
 
@@ -967,6 +989,8 @@ def _train_stage_ddp(args, model, fno, device, rank, world_size,
 def _train_worker_staged(rank, world_size, args):
     """分布式课程学习训练工作进程，在单个 mp.spawn 生命周期内依次执行所有阶段"""
     selected_gpus = getattr(args, 'selected_gpus', list(range(world_size)))
+    if len(selected_gpus) != world_size:
+        raise ValueError(f"selected_gpus 数量 {len(selected_gpus)} 与 world_size {world_size} 不一致")
     local_device = selected_gpus[rank]
     setup_distributed(rank, world_size, local_device=local_device)
     device = torch.device(f'cuda:{local_device}')
@@ -996,6 +1020,7 @@ def _train_worker_staged(rank, world_size, args):
     save_doc = args.save_doc
     if is_main_process(rank):
         os.makedirs(save_doc, exist_ok=True)
+    dist.barrier()
 
     base_vel_filename = args.vel_filename
     base_bg_filename = args.backgroundfield_filename
@@ -1027,12 +1052,14 @@ def _train_worker_staged(rank, world_size, args):
 
 def train_distributed_staged(args):
     """单机多卡分布式 + 课程学习训练入口函数"""
-    world_size = getattr(args, 'num_gpus', 1)
+    world_size = ddp_world_size_from_args(args)
+    args.num_gpus = world_size
 
     stages = getattr(args, 'stages', [])
     print("=" * 60)
     print(f"启动单机多卡分布式课程学习训练")
     print(f"GPU 数量: {world_size}")
+    print(f"GPU 列表: {getattr(args, 'selected_gpus', list(range(world_size)))}")
     print(f"训练阶段数: {len(stages)}")
     for si, s in enumerate(stages):
         print(f'  Stage {si}: {s["name"]} | freq [{s["freq_min"]}-{s["freq_max"]}] Hz | '

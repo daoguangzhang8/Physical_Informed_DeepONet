@@ -36,11 +36,20 @@ def main():
 
         available_gpus = get_available_gpus(min_memory_mb=min_gpu_memory, require_count=num_gpus)
 
-        if len(available_gpus) < num_gpus:
-            print(f"⚠️ 可用 GPU 不足 ({len(available_gpus)} < {num_gpus})，回退到单 GPU 模式")
+        if len(available_gpus) == 0:
+            print(f"⚠️ 未检测到满足内存要求的 GPU，回退到单 GPU/CPU 模式")
             args.use_parallel = False
-            args.device = available_gpus[0] if available_gpus else 0
+            args.device = 0
+        elif len(available_gpus) == 1:
+            print(f"⚠️ 仅检测到 1 个可用 GPU，回退到单 GPU 模式")
+            args.use_parallel = False
+            args.device = available_gpus[0]
         else:
+            if len(available_gpus) < num_gpus:
+                print(f"⚠️ 请求 {num_gpus} 个 GPU，但只有 {len(available_gpus)} 个可用；将使用全部可用 GPU")
+                num_gpus = len(available_gpus)
+                args.num_gpus = num_gpus
+
             print(f"✅ 检测到 {len(available_gpus)} 个可用 GPU: {available_gpus[:num_gpus]}")
             print("=" * 60)
             args.selected_gpus = available_gpus[:num_gpus]

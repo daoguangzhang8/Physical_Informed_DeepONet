@@ -640,16 +640,19 @@ class ConvBranch2d(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 16, 3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.GELU(),
-            nn.Conv2d(16, 32, 3, padding=1),
+            nn.Conv2d(in_channels, 32, 3, padding=1),
             nn.BatchNorm2d(32),
             nn.GELU(),
             nn.Conv2d(32, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.GELU(),
-            nn.Conv2d(64, out_channels, 3, padding=1),
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.GELU(),
+            nn.Conv2d(256, out_channels, 3, padding=1),
         )
 
     def forward(self, x):

@@ -117,8 +117,8 @@ def setup_distributed(rank, world_size, local_device=None):
         rank: 当前进程的 rank (0, 1, 2, ...)
         world_size: 总进程数 (等于 GPU 数量)
     """
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29500'
+    os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+    os.environ.setdefault('MASTER_PORT', '29500')
 
     # 初始化进程组 (单机固定使用 nccl 后端)
     dist.init_process_group('nccl', rank=rank, world_size=world_size)
@@ -195,7 +195,7 @@ def get_available_gpus(min_memory_mb=10240, require_count=None):
         # 检查 GPU 数量是否满足要求
         if require_count is not None and len(available_gpus) < require_count:
             print(f"⚠️ 警告: 需要 {require_count} 个 GPU，但只有 {len(available_gpus)} 个可用")
-            return []
+            return available_gpus
 
         return available_gpus
 
@@ -287,6 +287,14 @@ def wrap_model_for_distributed(model, rank, device_id=None):
     model = DDP.DistributedDataParallel(model, device_ids=[device_id], find_unused_parameters=False)
 
     return model
+
+
+def ddp_world_size_from_args(args):
+    """Prefer the actually selected GPU list over the requested num_gpus."""
+    selected_gpus = getattr(args, 'selected_gpus', None)
+    if selected_gpus:
+        return len(selected_gpus)
+    return int(getattr(args, 'num_gpus', 1))
 
 
 def is_main_process(rank=None):

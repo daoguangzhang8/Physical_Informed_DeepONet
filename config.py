@@ -4,7 +4,7 @@ class Args:
     # ==========================================
     load_path = '/home/sharedata/zdg'         # 数据集加载根目录
     weights_save_path = '/home/sharedata/zdg' # 模型权重保存根目录
-    save_doc = 'output_cnn1'                       # 结果输出文件夹名称
+    save_doc = 'output_cnn_lr1e-4'                       # 结果输出文件夹名称
     filename = 'PI_DeepONet_pde'              # 保存的模型前缀名称
 
     # 训练数据文件名
@@ -40,8 +40,9 @@ class Args:
     # ==========================================
     device = 2                                 # 单 GPU 模式: 指定使用的 GPU 设备编号
     use_parallel = True                      # 是否启用多 GPU 并行训练 (True: 多GPU | False: 单GPU)
-    num_gpus = 2                              # 使用的 GPU 数量
+    num_gpus = 2                              # 使用的 GPU 数量；8/16 卡运行时改为对应数量
     min_gpu_memory = 23 * 1024                # GPU 最小可用内存 (MB)，低于此值的 GPU 不会被使用
+    ddp_num_workers = 2                       # DDP 每个 rank 的 DataLoader worker 数；16 卡时避免进程过多
 
     # ==========================================
     # 3. 物理网格与边界条件 (Physical Grid & PML)
@@ -64,7 +65,7 @@ class Args:
     # 4. 数据集与采样 (Dataset & Sampling)
     # ==========================================
     nvel_train = 4500                           # 训练所用的速度模型数量
-    source_list = [2]                         # [0, 1, 2, 3, 4] 训练数据中包含的震源编号列表 (0-4 共5个震源)
+    source_list = [0, 1, 2, 3, 4]                         # [0, 1, 2, 3, 4] 训练数据中包含的震源编号列表 (0-4 共5个震源)
 
     # 空间点采样模式
     sampling_mode = 'halton'                  # 'full_grid': 全网格采样 | 'halton': Halton 准随机采样
@@ -72,9 +73,9 @@ class Args:
 
     # 批处理配置
     batch_size = 1600                          # Trunk Net 坐标采样批次大小 (num_sample)
-    batch_size_v = 40                          # Branch Net 速度场/背景场批次大小 (Batch_v)
+    batch_size_v = 48                          # Branch Net 速度场/背景场批次大小 (Batch_v)
     ny_train = int(nz * nx * halton_sample_ratio)  # 训练集空间采样点总数 (由网格尺寸和采样比例自动计算)
-    accumulation_steps = 2                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
+    accumulation_steps = 1                    # 梯度累加步数 (用于等效增大 batch size，节约显存)
 
     # 验证集
     valid_rate = 0.1                          # 验证集划分比例
@@ -84,8 +85,8 @@ class Args:
     # ==========================================
     # 5. 训练超参数 (Training Hyperparameters)
     # ==========================================
-    NIter = 5000 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
-    lr = 3 * 1e-4                             # 初始基础学习率
+    NIter = 10000 + 1                         # 总训练 epoch 数 (+1 确保最后一步记录和保存生效)
+    lr = 1 * 1e-4                             # 初始基础学习率
     weight_decay = 1e-4                       # 优化器权重衰减 (L2 正则化)系数
 
     # DDP 与单卡结果对齐配置
@@ -104,7 +105,7 @@ class Args:
     min_lr = 1e-5                             # 允许的最小学习率
 
     # CosineAnnealingWarmRestarts 参数
-    cosine_T_0 = 5001                         # 首个周期的 epoch 长度
+    cosine_T_0 = 10001                         # 首个周期的 epoch 长度
     cosine_T_mult = 2                         # 后续周期倍增系数 (T_0, T_0*2, T_0*4, ...)
     cosine_eta_min = 1e-5                     # 余弦退火最低学习率
 
