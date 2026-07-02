@@ -649,6 +649,30 @@ class ConvBranch2d(nn.Module):
             nn.Conv2d(64, 128, 3, padding=1),
             nn.BatchNorm2d(128),
             nn.GELU(),
+            # nn.Conv2d(128, 256, 3, padding=1),
+            # nn.BatchNorm2d(256),
+            # nn.GELU(),
+            nn.Conv2d(128, out_channels, 3, padding=1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ConvBranch2dDeep(nn.Module):
+    """Compatibility branch for checkpoints trained with the older 4-block CNN branch."""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
             nn.Conv2d(128, 256, 3, padding=1),
             nn.BatchNorm2d(256),
             nn.GELU(),

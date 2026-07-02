@@ -3,6 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+try:
+    import lpips
+except ImportError:
+    lpips = None
+
 from Labconfig import *
 from model.utils import *
 from model.dataloader import *
@@ -28,21 +33,49 @@ class Pi_DeepONet(nn.Module):
         self.pos_encoder = PositionalEncoding(embed_dim=4, max_scale=args.pe_max_scale)
         self.kpe = WavenumberPE(embed_dim=4)
         self.kpe_alpha = nn.Parameter(torch.tensor(0.0), requires_grad=False)  # KPE 当前未接入 forward
+        self.use_kpe = bool(getattr(args, 'use_kpe', False))
         # self.fencoder = FourierFeatureEncoder(input_dim=2, mapping_size=self.feat_dim)  # 未使用，已注释
 
         # --- 网络分支 (Branch) ---
+        branch1_modes = int(getattr(args, 'branch1_modes', 12))
+        branch1_width = int(getattr(args, 'branch1_width', 32))
         self.branch1 = nn.Sequential(
-            FNO2d(input_shape_branch1[1], self.feat_dim, modes1=12, modes2=12, width=32),
+            FNO2d(input_shape_branch1[1], self.feat_dim,
+                  modes1=branch1_modes, modes2=branch1_modes, width=branch1_width),
         )
 
         branch2_type = getattr(args, 'branch2_type', 'fno')
-        if branch2_type == 'resnet':
+        self.branch2_type = branch2_type
+        if branch2_type == 'hybrid':
+            branch2_modes = int(getattr(args, 'branch2_global_modes', 32))
+            branch2_width = int(getattr(args, 'branch2_global_width', 32))
+            self.branch2_global = nn.Sequential(
+                FNO2d(input_shape_branch2[1], self.feat_dim,
+                      modes1=branch2_modes, modes2=branch2_modes, width=branch2_width),
+            )
+            branch2_local_type = getattr(args, 'branch2_local_type', 'conv')
+            if branch2_local_type == 'resnet':
+                self.branch2_local = ResNetBranch2d(input_shape_branch2[1], self.feat_dim, base_width=64)
+            else:
+                self.branch2_local = ConvBranch2d(input_shape_branch2[1], self.feat_dim)
+            self.branch2_freq_gate = nn.Sequential(
+                nn.Linear(1, 32),
+                nn.GELU(),
+                nn.Linear(32, self.feat_dim),
+                nn.Sigmoid(),
+            )
+        elif branch2_type == 'resnet':
             self.branch2 = ResNetBranch2d(input_shape_branch2[1], self.feat_dim, base_width=64)
         elif branch2_type == 'conv':
             self.branch2 = ConvBranch2d(input_shape_branch2[1], self.feat_dim)
+        elif branch2_type == 'conv_deep':
+            self.branch2 = ConvBranch2dDeep(input_shape_branch2[1], self.feat_dim)
         else:
+            branch2_modes = int(getattr(args, 'branch2_modes', 32))
+            branch2_width = int(getattr(args, 'branch2_width', 32))
             self.branch2 = nn.Sequential(
-                FNO2d(input_shape_branch2[1], self.feat_dim, modes1=32, modes2=32, width=32),
+                FNO2d(input_shape_branch2[1], self.feat_dim,
+                      modes1=branch2_modes, modes2=branch2_modes, width=branch2_width),
             )
         
         # --- 注意力与特征融合 ---
@@ -55,14 +88,87 @@ class Pi_DeepONet(nn.Module):
         self.smooth_feature_encoder = SmoothBlockEncoder(self.feat_dim, self.feat_dim, grid_size=40)
 
         # --- 主干网络 (Trunk) 与输出层 ---
-        self.trunk = FiLMTrunk(input_dim=16, width=self.feat_dim, branch_feat_dim=self.feat_dim)
+        self.use_trunk_freq_encoding = bool(getattr(args, 'use_trunk_freq_encoding', False))
+        self.trunk_freq_embed_dim = int(getattr(args, 'trunk_freq_embed_dim', 8))
+        self.trunk_freq_num_bands = int(getattr(args, 'trunk_freq_num_bands', 3))
+        if self.use_trunk_freq_encoding:
+            freq_feature_dim = 1 + 2 * self.trunk_freq_num_bands
+            self.trunk_freq_encoder = nn.Sequential(
+                nn.Linear(freq_feature_dim, 32),
+                nn.GELU(),
+                nn.Linear(32, self.trunk_freq_embed_dim),
+            )
+            trunk_input_dim = 16 + self.trunk_freq_embed_dim
+        else:
+            self.trunk_freq_encoder = None
+            trunk_input_dim = 16
+
+        self.trunk = FiLMTrunk(input_dim=trunk_input_dim, width=self.feat_dim, branch_feat_dim=self.feat_dim)
         self.final_layer = nn.Linear(self.feat_dim, 2)  # 输出实部和虚部
         
         # --- 损失函数组件 ---
         self.loss_function = nn.MSELoss(reduction='mean')
         # self.loss_function_point = nn.MSELoss(reduction='none')  # 未使用，已注释
+        if getattr(args, 'use_lpips_loss', False):
+            if lpips is None:
+                raise ImportError('use_lpips_loss=True 需要先安装 lpips: pip install lpips')
+            self.lpips_fn = lpips.LPIPS(
+                net=getattr(args, 'lpips_net', 'alex'),
+                verbose=False,
+            )
+            self.lpips_fn.eval()
+            for p in self.lpips_fn.parameters():
+                p.requires_grad_(False)
+        else:
+            self.lpips_fn = None
 
         self._init_weights()
+
+    def _forward_branch2(self, UU0, freq_batch=None):
+        """Forward UU0 through the selected branch2 architecture."""
+        if self.branch2_type != 'hybrid':
+            return self.branch2(UU0)
+
+        global_feat = self.branch2_global(UU0)
+        local_feat = self.branch2_local(UU0)
+        if freq_batch is None:
+            freq_batch = torch.full(
+                (UU0.shape[0],), self.args.default_freq,
+                device=UU0.device,
+                dtype=UU0.dtype,
+            )
+        gate_norm = float(getattr(self.args, 'branch2_freq_gate_norm_hz', 25.0))
+        freq_input = (freq_batch.to(device=UU0.device, dtype=UU0.dtype) / max(gate_norm, 1e-8)).unsqueeze(-1)
+        local_gate = self.branch2_freq_gate(freq_input).unsqueeze(-1).unsqueeze(-1)
+        return local_gate * local_feat + (1.0 - local_gate) * global_feat
+
+    def _encode_trunk_frequency(self, freq_batch, batch_size, num_points, device, dtype):
+        """Encode per-sample frequency and broadcast it to every trunk query point."""
+        if self.trunk_freq_encoder is None:
+            return None
+
+        if freq_batch is None:
+            freq_batch = torch.full(
+                (batch_size,),
+                float(getattr(self.args, 'default_freq', 5.0)),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            freq_batch = freq_batch.to(device=device, dtype=dtype).reshape(-1)
+            if freq_batch.numel() == 1 and batch_size > 1:
+                freq_batch = freq_batch.expand(batch_size)
+
+        norm_hz = max(float(getattr(self.args, 'trunk_freq_norm_hz', 25.0)), 1e-8)
+        freq_norm = freq_batch / norm_hz
+        features = [freq_norm.unsqueeze(-1)]
+        for band in range(self.trunk_freq_num_bands):
+            phase = (2.0 ** band) * 2.0 * np.pi * freq_norm
+            features.extend([torch.sin(phase).unsqueeze(-1), torch.cos(phase).unsqueeze(-1)])
+
+        freq_features = torch.cat(features, dim=-1)
+        freq_encoded = self.trunk_freq_encoder(freq_features)
+        return freq_encoded.unsqueeze(1).expand(-1, num_points, -1)
 
     def _init_weights(self):
         """初始化网络权重，Sin 激活层使用 SIREN 初始化 (Sitzmann et al., 2020)"""
@@ -124,25 +230,35 @@ class Pi_DeepONet(nn.Module):
         x_encoded = self.pos_encoder(x_normalized)
         y_encoded = torch.cat([z_encoded, x_encoded], dim=2)  # [B_v, B_pts, 16]
 
-        # 残差波数 PE (已禁用，保留代码备用)
-        # if self.kpe_alpha.item() != 0.0 or self.training:
-        #     if freq_batch is None:
-        #         freq_batch = torch.full((vel.shape[0],), self.args.default_freq, device=vel.device)
-        #     c_ref = vel.mean(dim=[2, 3]).squeeze(1)
-        #     omega = 2 * np.pi * freq_batch * 1e-3
-        #     k_ref = (omega / c_ref).unsqueeze(-1).unsqueeze(-1)
-        #     k_encoded = self.kpe(y, k_ref)
-        #     alpha = 0.1 * torch.tanh(self.kpe_alpha)
-        #     if not hasattr(self, '_kpe_shape_logged'):
-        #         print(f"[DEBUG] kpe shapes — y: {y.shape}, k_ref: {k_ref.shape}, "
-        #               f"y_encoded: {y_encoded.shape}, k_encoded: {k_encoded.shape}, alpha: {alpha.shape}")
-        #         self._kpe_shape_logged = True
-        #     k_dim = y_encoded.shape[-1]
-        #     y_encoded = y_encoded + alpha * k_encoded[:, :, :k_dim]
+        # 残差波数 PE 默认关闭；仅通过 use_kpe=True 显式启用以兼容旧实验。
+        if self.use_kpe and self.kpe_alpha.item() != 0.0:
+            if freq_batch is None:
+                freq_batch = torch.full((vel.shape[0],), self.args.default_freq, device=vel.device)
+            c_ref = vel.mean(dim=[2, 3]).squeeze(1)
+            omega = 2 * np.pi * freq_batch * 1e-3
+            k_ref = (omega / c_ref).unsqueeze(-1).unsqueeze(-1)
+            k_encoded = self.kpe(y, k_ref)
+            alpha = 0.1 * torch.tanh(self.kpe_alpha)
+            if not hasattr(self, '_kpe_shape_logged'):
+                print(f"[DEBUG] kpe shapes — y: {y.shape}, k_ref: {k_ref.shape}, "
+                      f"y_encoded: {y_encoded.shape}, k_encoded: {k_encoded.shape}, alpha: {alpha.shape}")
+                self._kpe_shape_logged = True
+            k_dim = y_encoded.shape[-1]
+            y_encoded = y_encoded + alpha * k_encoded[:, :, :k_dim]
+
+        freq_encoded = self._encode_trunk_frequency(
+            freq_batch,
+            batch_size=vel.shape[0],
+            num_points=y.shape[1],
+            device=y.device,
+            dtype=y.dtype,
+        )
+        if freq_encoded is not None:
+            y_encoded = torch.cat([y_encoded, freq_encoded], dim=2)
         
         # --- 2. Branch 特征提取与 Tokenization (Memory/Key-Value) ---
         B1_raw = self.branch1(vel)
-        B2_raw = self.branch2(UU0)
+        B2_raw = self._forward_branch2(UU0, freq_batch=freq_batch)
         
         B1_raw = self.channel_attention1(B1_raw)
         B2_raw = self.channel_attention2(B2_raw)
@@ -165,6 +281,86 @@ class Pi_DeepONet(nn.Module):
         pred = self.forward(vel, y, UU0, freq_batch=freq_batch)
         loss_u = self.loss_function(pred, labels)
         return loss_u
+
+    def _frequency_data_weights(self, freq_batch, epoch=None):
+        """Return fixed per-sample frequency weights normalized to dataset mean 1."""
+        if freq_batch is None or not getattr(self.args, 'use_frequency_data_weight', False):
+            return None
+
+        start_hz = float(getattr(self.args, 'frequency_data_weight_start_hz', 12.0))
+        end_hz = float(getattr(self.args, 'frequency_data_weight_end_hz', 25.0))
+        max_weight = float(getattr(self.args, 'frequency_data_weight_max', 1.0))
+        if max_weight <= 1.0 or end_hz <= start_hz:
+            return None
+
+        freq = freq_batch.to(dtype=torch.float32)
+        progress = ((freq - start_hz) / (end_hz - start_hz)).clamp(0.0, 1.0)
+        cosine_progress = 0.5 * (1.0 - torch.cos(progress * torch.pi))
+        target_weight = 1.0 + (max_weight - 1.0) * cosine_progress
+
+        target_mean = float(getattr(self.args, 'frequency_data_weight_target_mean', 1.0))
+        return target_weight / max(target_mean, 1e-8)
+
+    def _hard_data_point_weights(self, point_mse, epoch=None):
+        """Return per-point hard weights normalized to mean 1 for each velocity sample."""
+        if not getattr(self.args, 'use_hard_data_weight', False):
+            return None
+
+        start_epoch = int(getattr(self.args, 'hard_data_start_epoch', 0))
+        if epoch is None:
+            epoch = start_epoch + int(getattr(self.args, 'hard_data_ramp_epochs', 0))
+        if epoch < start_epoch:
+            return None
+
+        max_weight = float(getattr(self.args, 'hard_data_max_weight', 1.0))
+        gamma = float(getattr(self.args, 'hard_data_gamma', 0.5))
+        if max_weight <= 1.0 or gamma <= 0.0:
+            return None
+
+        ramp_epochs = int(getattr(self.args, 'hard_data_ramp_epochs', 0))
+        if ramp_epochs > 0:
+            progress = min(max(float(epoch - start_epoch) / ramp_epochs, 0.0), 1.0)
+            ramp = 0.5 * (1.0 - np.cos(np.pi * progress))
+        else:
+            ramp = 1.0
+        if ramp <= 0.0:
+            return None
+
+        with torch.no_grad():
+            score = point_mse.detach()
+            score_mean = score.mean(dim=1, keepdim=True).clamp_min(1e-12)
+            target_weights = (score / score_mean).clamp_min(1e-8).pow(gamma)
+            target_weights = torch.clamp(target_weights, max=max_weight)
+            target_weights = target_weights / target_weights.mean(dim=1, keepdim=True).clamp_min(1e-12)
+            weights = 1.0 + float(ramp) * (target_weights - 1.0)
+            weights = weights / weights.mean(dim=1, keepdim=True).clamp_min(1e-12)
+
+        return weights
+
+    def _data_loss(self, pred, target, data_norm_coe, freq_batch=None,
+                   apply_frequency_data_weight=True, epoch=None):
+        sq_error = (pred - target) ** 2
+        if sq_error.dim() >= 3:
+            point_mse = torch.mean(sq_error, dim=tuple(range(2, sq_error.dim())))
+        else:
+            point_mse = sq_error
+
+        point_weights = None
+        if apply_frequency_data_weight:
+            point_weights = self._hard_data_point_weights(point_mse, epoch=epoch)
+        if point_weights is not None:
+            point_mse = point_mse * point_weights.to(device=point_mse.device)
+
+        if point_mse.dim() > 1:
+            sample_mse = torch.mean(point_mse, dim=tuple(range(1, point_mse.dim())))
+        else:
+            sample_mse = point_mse
+        weights = None
+        if apply_frequency_data_weight:
+            weights = self._frequency_data_weights(freq_batch, epoch=epoch)
+        if weights is not None:
+            sample_mse = sample_mse * weights.to(device=sample_mse.device)
+        return torch.mean(sample_mse) / data_norm_coe
 
     def dynamic_barrier_loss(self, error, r0=8, lambda_aux=1.0):
         """
@@ -446,8 +642,76 @@ class Pi_DeepONet(nn.Module):
         loss_env = torch.abs(env_pred - env_fno)
         return torch.mean(loss_env)
 
+    def make_lpips_grid(self, batch_size, device):
+        """Create an image-ordered LPIPS coordinate grid."""
+        grid_size = int(getattr(self.args, 'lpips_grid_size', 64))
+        if grid_size <= 0:
+            h, w = int(self.args.nz), int(self.args.nx)
+        else:
+            h = w = grid_size
+
+        z = torch.linspace(0, (self.args.nz - 1) * self.args.dh, h, device=device)
+        x = torch.linspace(0, (self.args.nx - 1) * self.args.dh, w, device=device)
+        grid_z, grid_x = torch.meshgrid(z, x, indexing='ij')
+        y = torch.stack([grid_z.reshape(-1), grid_x.reshape(-1)], dim=-1)
+        y = y.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+        return y, h, w
+
+    def labels_to_lpips_image(self, labels, y, h, w):
+        """Sample dense labels at image-ordered coordinates and return [B, 2, H, W]."""
+        batch_size = labels.shape[0]
+        z = y[:, :, 0] / (self.args.dh * (labels.shape[-2] - 1))
+        x = y[:, :, 1] / (self.args.dh * (labels.shape[-1] - 1))
+        grid = torch.stack([2.0 * x - 1.0, 2.0 * z - 1.0], dim=-1).view(batch_size, h, w, 2)
+        return F.grid_sample(
+            labels,
+            grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True,
+        )
+
+    def pred_to_lpips_image(self, pred, h, w):
+        """Convert image-ordered point predictions [B, H*W, 2] to [B, 2, H, W]."""
+        return pred.view(pred.shape[0], h, w, 2).permute(0, 3, 1, 2).contiguous()
+
+    def lpips_loss_from_images(self, pred_img, target_img):
+        """Compute LPIPS on real/imag channels separately using target-based normalization."""
+        if self.lpips_fn is None:
+            return torch.zeros((), device=pred_img.device)
+
+        self.lpips_fn.eval()
+        loss = torch.zeros((), device=pred_img.device)
+        for c in (0, 1):
+            pred_c = pred_img[:, c]
+            target_c = target_img[:, c]
+
+            target_min = target_c.amin(dim=(1, 2), keepdim=True)
+            target_max = target_c.amax(dim=(1, 2), keepdim=True)
+            scale = (target_max - target_min).clamp_min(1e-6)
+
+            pred_norm = (pred_c - target_min) / scale * 2.0 - 1.0
+            target_norm = (target_c - target_min) / scale * 2.0 - 1.0
+
+            pred_rgb = pred_norm[:, None].repeat(1, 3, 1, 1)
+            target_rgb = target_norm[:, None].repeat(1, 3, 1, 1)
+            loss = loss + self.lpips_fn(pred_rgb, target_rgb).mean()
+
+        return loss / 2.0
+
+    def lpips_loss_on_grid(self, vel, UU0, labels, freq_batch=None):
+        """Forward a separate LPIPS grid and compute perceptual loss."""
+        if self.lpips_fn is None:
+            return torch.zeros((), device=vel.device)
+
+        y_lpips, h, w = self.make_lpips_grid(vel.shape[0], vel.device)
+        pred = self.forward(vel, y_lpips, UU0, freq_batch=freq_batch)
+        pred_img = self.pred_to_lpips_image(pred, h, w)
+        target_img = self.labels_to_lpips_image(labels, y_lpips, h, w)
+        return self.lpips_loss_from_images(pred_img, target_img)
+
         
-    def loss(self, vel, y, UU0, labels, a, b, c, d=0., data_norm_coe=1., pde_norm_coe=1., env_norm_coe=1., freq_batch=None, y_ran=None):
+    def loss(self, vel, y, UU0, labels, a, b, c, d=0., data_norm_coe=1., pde_norm_coe=1., env_norm_coe=1., freq_batch=None, y_ran=None, apply_frequency_data_weight=True, epoch=None):
         """
         核心损失函数计算接口。
         优化：只做一次 forward pass，同时服务于 BC loss、PDE loss 和 Envelope loss。
@@ -481,7 +745,12 @@ class Pi_DeepONet(nn.Module):
 
         # 4. BC loss: 使用前 n_y 个点的预测
         pred_y = Delta_U[:, :n_y, :]
-        loss_u = self.loss_function(pred_y, labels) / data_norm_coe
+        loss_u = self._data_loss(
+            pred_y, labels, data_norm_coe,
+            freq_batch=freq_batch,
+            apply_frequency_data_weight=apply_frequency_data_weight,
+            epoch=epoch,
+        )
 
         # 5. Envelope loss (已禁用)
         # env_pred = torch.sqrt(pred_y[..., 0]**2 + pred_y[..., 1]**2 + 1e-8)
@@ -489,8 +758,13 @@ class Pi_DeepONet(nn.Module):
         # loss_env = self.loss_function(env_pred, env_label) / env_norm_coe
         loss_env = torch.tensor(0.0, device=vel.device)
 
-        # 6. PDE loss: 使用完整输出计算物理残差
-        loss_f_combined = self._compute_pde_residual(vel, y_combined, UU0, Delta_U, freq_batch=freq_batch) / pde_norm_coe
+        # 6. PDE loss: b=0 的纯数据拟合实验跳过昂贵的二阶导计算
+        if b != 0:
+            loss_f_combined = self._compute_pde_residual(
+                vel, y_combined, UU0, Delta_U, freq_batch=freq_batch
+            ) / pde_norm_coe
+        else:
+            loss_f_combined = torch.zeros((), device=vel.device)
 
         loss_r = 0.0  # 占位
 
@@ -500,7 +774,7 @@ class Pi_DeepONet(nn.Module):
         return loss_val, loss_f_combined, loss_u, loss_r, loss_env
 
     def compute_loss(self, Delta_U, vel, y, UU0, labels, y_combined,
-                     a, b, c, d=0., data_norm_coe=1., pde_norm_coe=1., env_norm_coe=1., freq_batch=None):
+                     a, b, c, d=0., data_norm_coe=1., pde_norm_coe=1., env_norm_coe=1., freq_batch=None, apply_frequency_data_weight=True, epoch=None):
         """
         在 DDP forward 之后计算损失 (不包含 forward 调用)。
         供 DDP 训练使用：先通过 DDP wrapper 调用 forward()，再调用此方法计算 loss。
@@ -532,7 +806,12 @@ class Pi_DeepONet(nn.Module):
 
         # 2. 数据拟合损失
         pred_y = Delta_U[:, :n_y, :]
-        loss_u = self.loss_function(pred_y, labels_extracted) / data_norm_coe
+        loss_u = self._data_loss(
+            pred_y, labels_extracted, data_norm_coe,
+            freq_batch=freq_batch,
+            apply_frequency_data_weight=apply_frequency_data_weight,
+            epoch=epoch,
+        )
 
         # 3. Envelope loss (已禁用)
         # env_pred = torch.sqrt(pred_y[..., 0]**2 + pred_y[..., 1]**2 + 1e-8)
@@ -540,8 +819,13 @@ class Pi_DeepONet(nn.Module):
         # loss_env = self.loss_function(env_pred, env_label) / env_norm_coe
         loss_env = torch.tensor(0.0, device=vel.device)
 
-        # 4. PDE 物理残差损失
-        loss_f = self._compute_pde_residual(vel, y_combined, UU0, Delta_U, freq_batch=freq_batch) / pde_norm_coe
+        # 4. PDE 物理残差损失；b=0 时跳过二阶导计算
+        if b != 0:
+            loss_f = self._compute_pde_residual(
+                vel, y_combined, UU0, Delta_U, freq_batch=freq_batch
+            ) / pde_norm_coe
+        else:
+            loss_f = torch.zeros((), device=vel.device)
 
         loss_r = 0.0
 

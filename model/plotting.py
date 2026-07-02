@@ -156,6 +156,37 @@ def plot_loss(epoch, save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_lo
     plt.close()
 
 
+def plot_category_valid_loss(epoch, save_doc, category_valid_u_loss, category_valid_f_loss, suffix=''):
+    """按速度模型类别绘制验证损失曲线，用于观察训练集类别比例是否失衡。"""
+    if not category_valid_u_loss:
+        return
+
+    os.makedirs(save_doc, exist_ok=True)
+    plt.figure(figsize=(10, 5))
+    for category, values in category_valid_u_loss.items():
+        if not values:
+            continue
+        x_axis = np.linspace(0, epoch, num=len(values), endpoint=True)
+        plt.plot(x_axis, values, label=category)
+    plt.yscale('log')
+    plt.legend()
+    plt.title(f'epoch {epoch} Valid Data Loss by Category')
+    plt.savefig(f"{save_doc}/ValidDataloss_by_category{suffix}.png")
+    plt.close()
+
+    plt.figure(figsize=(10, 5))
+    for category, values in category_valid_f_loss.items():
+        if not values:
+            continue
+        x_axis = np.linspace(0, epoch, num=len(values), endpoint=True)
+        plt.plot(x_axis, values, label=category)
+    plt.yscale('log')
+    plt.legend()
+    plt.title(f'epoch {epoch} Valid PDE Loss by Category')
+    plt.savefig(f"{save_doc}/ValidPDEloss_by_category{suffix}.png")
+    plt.close()
+
+
 
 def test_plot(args, model, fno, i, dataloader_y, vel, UU0, labels, filename, if_fine_tune, loc=2, freq=None):
     if if_fine_tune:

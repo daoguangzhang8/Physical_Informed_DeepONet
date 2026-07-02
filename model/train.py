@@ -12,6 +12,96 @@ from model.FNO import FNO
 from model.plotting import *
 
 
+def _init_sobol_sampling(args, device, rank=0):
+    """Initialize persistent train Sobol sequence and fixed validation points."""
+    seed = int(getattr(args, 'sobol_seed', 0))
+    train_engine = make_sobol_engine(seed + rank)
+    valid_engine = make_sobol_engine(seed + 100000)
+    points_per_step = int(getattr(
+        args, 'sobol_points_per_step',
+        getattr(args, 'sobol_points_per_epoch', 800),
+    ))
+    steps_per_velocity_batch = int(getattr(args, 'sobol_steps_per_velocity_batch', 1))
+    valid_points = draw_sobol_grid_points(
+        valid_engine, getattr(args, 'valid_sobol_points', 800),
+        args.nz, args.nx, args.dh, device,
+    )
+    print(
+        f"Sobol 模式: 每次更新 {points_per_step} 点, "
+        f"每个 velocity batch 更新 {steps_per_velocity_batch} 次, "
+        f"固定验证 {len(valid_points)} 点"
+    )
+    return train_engine, valid_points, points_per_step, steps_per_velocity_batch
+
+
+def _draw_sobol_batch(engine, num_pts, args, device, batch_size):
+    points = draw_sobol_grid_points(engine, num_pts, args.nz, args.nx, args.dh, device)
+    return points.unsqueeze(0).expand(batch_size, -1, -1).clone().requires_grad_(True)
+
+
+def _maybe_add_lpips_loss(args, model, loss, loss_env,
+                          vel_batch, UU0_batch, labels_batch, freq_batch, epoch):
+    """Optionally add LPIPS perceptual loss on a separate image grid."""
+    if not getattr(args, 'use_lpips_loss', False):
+        return loss, loss_env
+    if epoch < int(getattr(args, 'lpips_start_epoch', 0)):
+        return loss, loss_env
+    interval = max(1, int(getattr(args, 'lpips_interval', 1)))
+    if epoch % interval != 0:
+        return loss, loss_env
+
+    loss_lpips = model.lpips_loss_on_grid(
+        vel_batch, UU0_batch, labels_batch, freq_batch=freq_batch
+    )
+    loss = loss + float(getattr(args, 'lpips_weight', 0.01)) * loss_lpips
+    return loss, loss_lpips
+
+
+def evaluate_valid_loader(model, loader, coord_loader, device, has_freq,
+                          a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                          use_sobol=False, valid_sobol_points=None):
+    batch_u_loss, batch_f_loss = [], []
+    for batch_data in loader:
+        if has_freq:
+            vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
+            freq_batch = freq_batch.to(device)
+        else:
+            vel_batch, UU0_batch, labels_batch = batch_data
+            freq_batch = None
+        vel_batch = vel_batch.to(device)
+        UU0_batch = UU0_batch.to(device)
+        labels_batch = labels_batch.to(device)
+
+        if use_sobol:
+            y_valid = valid_sobol_points.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
+            _, loss_f_valid, loss_u_valid, _, _ = model.loss(
+                vel_batch, y_valid, UU0_batch, labels_batch,
+                a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                freq_batch=freq_batch,
+                apply_frequency_data_weight=False,
+            )
+            batch_u_loss.append(loss_u_valid.item())
+            batch_f_loss.append(loss_f_valid.item())
+            del loss_f_valid, loss_u_valid, y_valid
+        else:
+            for batch in coord_loader:
+                y_batch = batch[0].to(device)
+                y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
+                _, loss_f_valid, loss_u_valid, _, _ = model.loss(
+                    vel_batch, y_batch, UU0_batch, labels_batch,
+                    a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                    freq_batch=freq_batch,
+                    apply_frequency_data_weight=False,
+                )
+                batch_u_loss.append(loss_u_valid.item())
+                batch_f_loss.append(loss_f_valid.item())
+
+    return (
+        np.mean(batch_u_loss) if batch_u_loss else 0.0,
+        np.mean(batch_f_loss) if batch_f_loss else 1.0,
+    )
+
+
 def _train_stage(args, model, fno, device, stage_idx, stage_config,
                  base_vel_filename, base_bg_filename, base_wf_filename, base_freq_filename):
     """
@@ -27,6 +117,7 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
     stage_warmup = stage_config.get('warmup_epochs', args.warmup_epochs)
     a = stage_config.get('a', args.a)
     b = stage_config.get('b', args.b)
+    pde_target_weight = b
     c = stage_config.get('c', args.c)
     d = getattr(args, 'd', 0.1)
 
@@ -192,18 +283,15 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
     # ---- 5. 训练状态 ----
     loss_log, loss_pde_log, loss_data_log, loss_reg_log, loss_env_log = [], [], [], [], []
     valid_u_loss, valid_f_loss = [], []
+    category_valid_u_loss = {name: [] for name in dataloader.get('valid_by_category', {})}
+    category_valid_f_loss = {name: [] for name in dataloader.get('valid_by_category', {})}
     first_flag = True
     pde_norm_coe, data_norm_coe, env_norm_coe = 1., 1., 1.
 
     # ---- 6. Sobol 引擎 ----
     use_sobol = getattr(args, 'sampling_strategy', 'original') == 'sobol'
     if use_sobol:
-        sobol_engine = torch.quasirandom.SobolEngine(dimension=2, scramble=True)
-        valid_sobol_engine = torch.quasirandom.SobolEngine(dimension=2, scramble=True)
-        sobol_scale = torch.tensor([args.nz * args.dh, args.nx * args.dh], dtype=torch.float32, device=device)
-        sobol_pts = getattr(args, 'sobol_points_per_epoch', 800)
-        valid_sobol_pts = getattr(args, 'valid_sobol_points', 800)
-        print(f"Sobol 模式: 每 epoch {sobol_pts} 点, 验证 {valid_sobol_pts} 点")
+        sobol_engine, valid_sobol_points, sobol_pts, sobol_steps = _init_sobol_sampling(args, device)
 
     # ---- 7. 主训练循环 ----
     optimizer.zero_grad()
@@ -215,7 +303,10 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
     epoch_score = None
 
     for i in pbar:
-        if args.if_adjust and i > args.adjust_from and (i - args.adjust_from) % args.adjust_every == 0:
+        b = cosine_pde_weight(args, i, pde_target_weight)
+        if (not getattr(args, 'use_pde_weight_ramp', False)
+                and args.if_adjust and i > args.adjust_from
+                and (i - args.adjust_from) % args.adjust_every == 0):
             decay_times = i // args.adjust_every
             a = max(a * (args.adjust_speed ** (-decay_times)), 2e-1)
             b, c = 1, 0
@@ -223,13 +314,9 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
         model.train()
         batch_loss, batch_u_loss, batch_f_loss, batch_r_loss, batch_env_loss = [], [], [], [], []
 
-        if use_sobol:
-            y_sobol_base = sobol_engine.draw(sobol_pts).to(device)
-            y_sobol_base = y_sobol_base * sobol_scale
-
         # y_ran: 每 epoch 生成一次（epoch shared 路径）
         y_ran_epoch_shared = None
-        if not use_sobol and getattr(args, 'use_y_ran', False) and getattr(args, 'use_epoch_shared_y_ran', False):
+        if getattr(args, 'use_y_ran', False) and getattr(args, 'use_epoch_shared_y_ran', False):
             should_update_prob = (
                 epoch_prob is None
                 or args.y_ran_prob_update_every == 1
@@ -273,39 +360,46 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
             else:
                 labels_batch = labels_batch.to(device)
 
+            if y_ran_epoch_shared is not None:
+                y_ran = y_ran_epoch_shared.unsqueeze(0).expand(
+                    vel_batch.shape[0], -1, -1
+                ).clone().requires_grad_(True)
+            elif getattr(args, 'use_y_ran', False):
+                with torch.no_grad():
+                    y_ran = model.generate_structure_aware_y_ran(
+                        vel_batch, num_pts=args.y_ran_num_pts
+                    )
+            else:
+                y_ran = None
+
             if use_sobol:
-                y_sobol = y_sobol_base.unsqueeze(0).expand(vel_batch.shape[0], -1, -1).clone()
-                y_sobol.requires_grad_(True)
+                for _ in range(sobol_steps):
+                    y_sobol = _draw_sobol_batch(
+                        sobol_engine, sobol_pts, args, device, vel_batch.shape[0]
+                    )
+                    loss, loss_f, loss_u, loss_r, loss_env = model.loss(
+                        vel_batch, y_sobol, UU0_batch, labels_batch,
+                        a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                        freq_batch=freq_batch, y_ran=y_ran, epoch=i
+                    )
+                    loss, loss_env = _maybe_add_lpips_loss(
+                        args, model, loss, loss_env,
+                        vel_batch, UU0_batch, labels_batch, freq_batch, i
+                    )
 
-                loss, loss_f, loss_u, loss_r, loss_env = model.loss(
-                    vel_batch, y_sobol, UU0_batch, labels_batch,
-                    a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe, freq_batch=freq_batch,
-                    y_ran=None
-                )
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
+                    batch_loss.append(loss.item())
+                    batch_u_loss.append(loss_u.item())
+                    batch_f_loss.append(loss_f.item())
+                    batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
+                    batch_env_loss.append(loss_env.item())
 
-                batch_loss.append(loss.item())
-                batch_u_loss.append(loss_u.item())
-                batch_f_loss.append(loss_f.item())
-                batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
-                batch_env_loss.append(loss_env.item())
-
-                del loss, loss_f, loss_u, loss_r, loss_env, y_sobol
+                    del loss, loss_f, loss_u, loss_r, loss_env, y_sobol
 
             else:
-                # y_ran: 使用 epoch 预生成或 per-model 生成
-                if y_ran_epoch_shared is not None:
-                    y_ran = y_ran_epoch_shared.unsqueeze(0).expand(
-                        vel_batch.shape[0], -1, -1
-                    ).clone().requires_grad_(True)
-                elif getattr(args, 'use_y_ran', False):
-                    with torch.no_grad():
-                        y_ran = model.generate_structure_aware_y_ran(vel_batch, num_pts=900)
-                else:
-                    y_ran = None
 
                 for batch in dataloader['train_y']:
                     y_batch = batch[0].to(device)
@@ -314,7 +408,11 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
                     loss, loss_f, loss_u, loss_r, loss_env = model.loss(
                         vel_batch, y_batch, UU0_batch, labels_batch,
                         a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe, freq_batch=freq_batch,
-                        y_ran=y_ran
+                        y_ran=y_ran, epoch=i
+                    )
+                    loss, loss_env = _maybe_add_lpips_loss(
+                        args, model, loss, loss_env,
+                        vel_batch, UU0_batch, labels_batch, freq_batch, i
                     )
 
                     loss = loss / args.accumulation_steps
@@ -359,6 +457,7 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
             'PDE': f"{loss_pde_log[-1]:.4e}",
             'Data': f"{loss_data_log[-1]:.4e}",
             'Env': f"{loss_env_log[-1]:.4e}",
+            'PDE_W': f"{b:.3f}",
             'LR': f"{current_lr:.2e}"
         })
 
@@ -372,46 +471,22 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
         # ---- 验证 ----
         if i % args.validate_every == 0:
             model.eval()
-            batch_u_loss, batch_f_loss = [], []
+            u_loss, f_loss = evaluate_valid_loader(
+                model, dataloader['valid'], dataloader['valid_y'], device, has_freq,
+                a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                use_sobol, valid_sobol_points if use_sobol else None,
+            )
+            valid_u_loss.append(u_loss)
+            valid_f_loss.append(f_loss)
 
-            for batch_data in dataloader['valid']:
-                if has_freq:
-                    vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
-                    freq_batch = freq_batch.to(device)
-                else:
-                    vel_batch, UU0_batch, labels_batch = batch_data
-                    freq_batch = None
-                vel_batch = vel_batch.to(device)
-                UU0_batch = UU0_batch.to(device)
-                labels_batch = labels_batch.to(device)
-
-                if use_sobol:
-                    y_valid = valid_sobol_engine.draw(valid_sobol_pts).to(device)
-                    y_valid = y_valid * sobol_scale
-                    y_valid = y_valid.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
-
-                    _, loss_f_valid, loss_u_valid, _, _ = model.loss(
-                        vel_batch, y_valid, UU0_batch, labels_batch,
-                        a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe, freq_batch=freq_batch
-                    )
-                    batch_u_loss.append(loss_u_valid.item())
-                    batch_f_loss.append(loss_f_valid.item())
-
-                    del loss_f_valid, loss_u_valid, y_valid
-                else:
-                    for batch in dataloader['valid_y']:
-                        y_batch = batch[0].to(device)
-                        y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
-
-                        _, loss_f_valid, loss_u_valid, _, _ = model.loss(
-                            vel_batch, y_batch, UU0_batch, labels_batch,
-                            a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe, freq_batch=freq_batch
-                        )
-                        batch_u_loss.append(loss_u_valid.item())
-                        batch_f_loss.append(loss_f_valid.item())
-
-            valid_u_loss.append(np.mean(batch_u_loss) if batch_u_loss else 0.0)
-            valid_f_loss.append(np.mean(batch_f_loss) if batch_f_loss else 1.0)
+            for category_name, category_loader in dataloader.get('valid_by_category', {}).items():
+                cat_u_loss, cat_f_loss = evaluate_valid_loader(
+                    model, category_loader, dataloader['valid_y'], device, has_freq,
+                    a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                    use_sobol, valid_sobol_points if use_sobol else None,
+                )
+                category_valid_u_loss.setdefault(category_name, []).append(cat_u_loss)
+                category_valid_f_loss.setdefault(category_name, []).append(cat_f_loss)
 
         # ---- 可视化 ----
         if i % args.save_fig_every == 0:
@@ -427,6 +502,10 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
 
             plot_loss(i, save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss,
                       suffix=f'_stage{stage_idx}')
+            plot_category_valid_loss(
+                i, save_doc, category_valid_u_loss, category_valid_f_loss,
+                suffix=f'_stage{stage_idx}'
+            )
 
             test_plot(args, model, fno, i, dataloader["pred"], vel_pred, UU0_pred, labels_pred,
                       f'valid_stage{stage_idx}', if_fine_tune=False, freq=freq_pred)
@@ -451,6 +530,8 @@ def _train_stage(args, model, fno, device, stage_idx, stage_config,
             np.save(os.path.join(save_doc, f'loss_data_log_stage{stage_idx}.npy'), loss_data_log)
             np.save(os.path.join(save_doc, f'loss_pde_log_stage{stage_idx}.npy'), loss_pde_log)
             np.save(os.path.join(save_doc, f'loss_env_log_stage{stage_idx}.npy'), loss_env_log)
+            np.save(os.path.join(save_doc, f'valid_category_data_loss_stage{stage_idx}.npy'), category_valid_u_loss)
+            np.save(os.path.join(save_doc, f'valid_category_pde_loss_stage{stage_idx}.npy'), category_valid_f_loss)
 
     # ---- 8. 阶段结束：保存最终权重 ----
     final_path = os.path.join(save_doc, f'{args.filename}_stage{stage_idx}_final_weights_{args.nz}.pth')
@@ -575,19 +656,17 @@ def train_single(args, device):
 
     loss_log, loss_pde_log, loss_data_log, loss_reg_log, loss_env_log = [], [], [], [], []
     valid_u_loss, valid_f_loss = [], []
+    category_valid_u_loss = {name: [] for name in dataloader.get('valid_by_category', {})}
+    category_valid_f_loss = {name: [] for name in dataloader.get('valid_by_category', {})}
 
     a, b, c, d = args.a, args.b, args.c, args.d
+    pde_target_weight = b
     first_flag = True
     pde_norm_coe, data_norm_coe, env_norm_coe = 1., 1., 1.
 
     use_sobol = getattr(args, 'sampling_strategy', 'original') == 'sobol'
     if use_sobol:
-        sobol_engine = torch.quasirandom.SobolEngine(dimension=2, scramble=True)
-        valid_sobol_engine = torch.quasirandom.SobolEngine(dimension=2, scramble=True)
-        sobol_scale = torch.tensor([args.nz * args.dh, args.nx * args.dh], dtype=torch.float32, device=device)
-        sobol_pts = getattr(args, 'sobol_points_per_epoch', 800)
-        valid_sobol_pts = getattr(args, 'valid_sobol_points', 800)
-        print(f"Sobol 模式: 每 epoch {sobol_pts} 点, 验证 {valid_sobol_pts} 点")
+        sobol_engine, valid_sobol_points, sobol_pts, sobol_steps = _init_sobol_sampling(args, device)
 
     optimizer.zero_grad()
     pbar = tqdm(range(args.NIter), desc="Training Progress", dynamic_ncols=True)
@@ -598,7 +677,10 @@ def train_single(args, device):
     epoch_score = None
 
     for i in pbar:
-        if args.if_adjust and i > args.adjust_from and (i - args.adjust_from) % args.adjust_every == 0:
+        b = cosine_pde_weight(args, i, pde_target_weight)
+        if (not getattr(args, 'use_pde_weight_ramp', False)
+                and args.if_adjust and i > args.adjust_from
+                and (i - args.adjust_from) % args.adjust_every == 0):
             decay_times = i // args.adjust_every
             a = max(a * (args.adjust_speed ** (-decay_times)), 2e-1)
             b, c = 1, 0
@@ -606,13 +688,9 @@ def train_single(args, device):
         model.train()
         batch_loss, batch_u_loss, batch_f_loss, batch_r_loss, batch_env_loss = [], [], [], [], []
 
-        if use_sobol:
-            y_sobol_base = sobol_engine.draw(sobol_pts).to(device)
-            y_sobol_base = y_sobol_base * sobol_scale
-
         # y_ran: 每 epoch 生成一次（epoch shared 路径）
         y_ran_epoch_shared = None
-        if not use_sobol and getattr(args, 'use_y_ran', False) and getattr(args, 'use_epoch_shared_y_ran', False):
+        if getattr(args, 'use_y_ran', False) and getattr(args, 'use_epoch_shared_y_ran', False):
             should_update_prob = (
                 epoch_prob is None
                 or args.y_ran_prob_update_every == 1
@@ -656,39 +734,46 @@ def train_single(args, device):
             else:
                 labels_batch = labels_batch.to(device)
 
+            if y_ran_epoch_shared is not None:
+                y_ran = y_ran_epoch_shared.unsqueeze(0).expand(
+                    vel_batch.shape[0], -1, -1
+                ).clone().requires_grad_(True)
+            elif getattr(args, 'use_y_ran', False):
+                with torch.no_grad():
+                    y_ran = model.generate_structure_aware_y_ran(
+                        vel_batch, num_pts=args.y_ran_num_pts
+                    )
+            else:
+                y_ran = None
+
             if use_sobol:
-                y_sobol = y_sobol_base.unsqueeze(0).expand(vel_batch.shape[0], -1, -1).clone()
-                y_sobol.requires_grad_(True)
+                for _ in range(sobol_steps):
+                    y_sobol = _draw_sobol_batch(
+                        sobol_engine, sobol_pts, args, device, vel_batch.shape[0]
+                    )
+                    loss, loss_f, loss_u, loss_r, loss_env = model.loss(
+                        vel_batch, y_sobol, UU0_batch, labels_batch,
+                        a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                        freq_batch=freq_batch, y_ran=y_ran, epoch=i
+                    )
+                    loss, loss_env = _maybe_add_lpips_loss(
+                        args, model, loss, loss_env,
+                        vel_batch, UU0_batch, labels_batch, freq_batch, i
+                    )
 
-                loss, loss_f, loss_u, loss_r, loss_env = model.loss(
-                    vel_batch, y_sobol, UU0_batch, labels_batch,
-                    a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe, freq_batch=freq_batch,
-                    y_ran=None
-                )
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
+                    batch_loss.append(loss.item())
+                    batch_u_loss.append(loss_u.item())
+                    batch_f_loss.append(loss_f.item())
+                    batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
+                    batch_env_loss.append(loss_env.item())
 
-                batch_loss.append(loss.item())
-                batch_u_loss.append(loss_u.item())
-                batch_f_loss.append(loss_f.item())
-                batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
-                batch_env_loss.append(loss_env.item())
-
-                del loss, loss_f, loss_u, loss_r, loss_env, y_sobol
+                    del loss, loss_f, loss_u, loss_r, loss_env, y_sobol
 
             else:
-                # y_ran: 使用 epoch 预生成或 per-model 生成
-                if y_ran_epoch_shared is not None:
-                    y_ran = y_ran_epoch_shared.unsqueeze(0).expand(
-                        vel_batch.shape[0], -1, -1
-                    ).clone().requires_grad_(True)
-                elif getattr(args, 'use_y_ran', False):
-                    with torch.no_grad():
-                        y_ran = model.generate_structure_aware_y_ran(vel_batch, num_pts=900)
-                else:
-                    y_ran = None
 
                 for batch in dataloader['train_y']:
                     y_batch = batch[0].to(device)
@@ -697,7 +782,11 @@ def train_single(args, device):
                     loss, loss_f, loss_u, loss_r, loss_env = model.loss(
                         vel_batch, y_batch, UU0_batch, labels_batch,
                         a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe, freq_batch=freq_batch,
-                        y_ran=y_ran
+                        y_ran=y_ran, epoch=i
+                    )
+                    loss, loss_env = _maybe_add_lpips_loss(
+                        args, model, loss, loss_env,
+                        vel_batch, UU0_batch, labels_batch, freq_batch, i
                     )
 
                     loss = loss / args.accumulation_steps
@@ -742,6 +831,7 @@ def train_single(args, device):
             'PDE': f"{loss_pde_log[-1]:.4e}",
             'Data': f"{loss_data_log[-1]:.4e}",
             'Env': f"{loss_env_log[-1]:.4e}",
+            'PDE_W': f"{b:.3f}",
             'LR': f"{current_lr:.2e}"
         })
 
@@ -755,46 +845,22 @@ def train_single(args, device):
         # ---- 验证 ----
         if i % args.validate_every == 0:
             model.eval()
-            batch_u_loss, batch_f_loss = [], []
+            u_loss, f_loss = evaluate_valid_loader(
+                model, dataloader['valid'], dataloader['valid_y'], device, has_freq,
+                a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                use_sobol, valid_sobol_points if use_sobol else None,
+            )
+            valid_u_loss.append(u_loss)
+            valid_f_loss.append(f_loss)
 
-            for batch_data in dataloader['valid']:
-                if has_freq:
-                    vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
-                    freq_batch = freq_batch.to(device)
-                else:
-                    vel_batch, UU0_batch, labels_batch = batch_data
-                    freq_batch = None
-                vel_batch = vel_batch.to(device)
-                UU0_batch = UU0_batch.to(device)
-                labels_batch = labels_batch.to(device)
-
-                if use_sobol:
-                    y_valid = valid_sobol_engine.draw(valid_sobol_pts).to(device)
-                    y_valid = y_valid * sobol_scale
-                    y_valid = y_valid.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
-
-                    _, loss_f_valid, loss_u_valid, _, _ = model.loss(
-                        vel_batch, y_valid, UU0_batch, labels_batch,
-                        a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe, freq_batch=freq_batch
-                    )
-                    batch_u_loss.append(loss_u_valid.item())
-                    batch_f_loss.append(loss_f_valid.item())
-
-                    del loss_f_valid, loss_u_valid, y_valid
-                else:
-                    for batch in dataloader['valid_y']:
-                        y_batch = batch[0].to(device)
-                        y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
-
-                        _, loss_f_valid, loss_u_valid, _, _ = model.loss(
-                            vel_batch, y_batch, UU0_batch, labels_batch,
-                            a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe, freq_batch=freq_batch
-                        )
-                        batch_u_loss.append(loss_u_valid.item())
-                        batch_f_loss.append(loss_f_valid.item())
-
-            valid_u_loss.append(np.mean(batch_u_loss) if batch_u_loss else 0.0)
-            valid_f_loss.append(np.mean(batch_f_loss) if batch_f_loss else 1.0)
+            for category_name, category_loader in dataloader.get('valid_by_category', {}).items():
+                cat_u_loss, cat_f_loss = evaluate_valid_loader(
+                    model, category_loader, dataloader['valid_y'], device, has_freq,
+                    a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                    use_sobol, valid_sobol_points if use_sobol else None,
+                )
+                category_valid_u_loss.setdefault(category_name, []).append(cat_u_loss)
+                category_valid_f_loss.setdefault(category_name, []).append(cat_f_loss)
 
         # ---- 可视化 ----
         if i % args.save_fig_every == 0:
@@ -805,6 +871,7 @@ def train_single(args, device):
             freq_test = plot_data["freq_train"] if has_freq else None
 
             plot_loss(i, args.save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss)
+            plot_category_valid_loss(i, args.save_doc, category_valid_u_loss, category_valid_f_loss)
 
             test_plot(args, model, fno, i, dataloader["pred"], vel_pred, UU0_pred, labels_pred, 'valid_without_fine_tune', if_fine_tune=False, freq=freq_pred)
             test_plot(args, model, fno, i, dataloader["test"], vel_test, UU0_test, labels_test, 'train', if_fine_tune=False, freq=freq_test)
@@ -825,6 +892,8 @@ def train_single(args, device):
             np.save(os.path.join(args.save_doc, 'loss_data_log.npy'), loss_data_log)
             np.save(os.path.join(args.save_doc, 'loss_pde_log.npy'), loss_pde_log)
             np.save(os.path.join(args.save_doc, 'loss_env_log.npy'), loss_env_log)
+            np.save(os.path.join(args.save_doc, 'valid_category_data_loss.npy'), category_valid_u_loss)
+            np.save(os.path.join(args.save_doc, 'valid_category_pde_loss.npy'), category_valid_f_loss)
 
     # 最终保存
     checkpoint = {
@@ -837,6 +906,8 @@ def train_single(args, device):
     np.save(os.path.join(args.save_doc, 'loss_data_log.npy'), loss_data_log)
     np.save(os.path.join(args.save_doc, 'loss_pde_log.npy'), loss_pde_log)
     np.save(os.path.join(args.save_doc, 'loss_env_log.npy'), loss_env_log)
+    np.save(os.path.join(args.save_doc, 'valid_category_data_loss.npy'), category_valid_u_loss)
+    np.save(os.path.join(args.save_doc, 'valid_category_pde_loss.npy'), category_valid_f_loss)
 
 
 def train(args):

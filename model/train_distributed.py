@@ -7,6 +7,7 @@
 
 import os
 import copy
+import socket
 import time
 from contextlib import nullcontext
 import numpy as np
@@ -26,13 +27,98 @@ from model.utils import (
     reduce_tensor,
     build_epoch_velocity_gradient_prob,
     sample_shared_y_ran_from_epoch_prob,
+    make_sobol_engine,
+    draw_sobol_grid_points,
     ddp_world_size_from_args,
+    cosine_pde_weight,
 )
 from model.dataloader import prepare_training_dataloaders, prepare_external_val_dataset
 from model.PI_DeepOnet import Pi_DeepONet
 from model.FNO import FNO
-from model.plotting import plot_loss, test_plot, plot_sinlge, fine_tuning
+from model.plotting import plot_loss, plot_category_valid_loss, test_plot, plot_sinlge, fine_tuning
 from model.utils import count_parameters, WarmupScheduler
+
+
+def _init_sobol_sampling(args, device, rank):
+    """Initialize rank-specific train Sobol sequence and fixed validation points."""
+    seed = int(getattr(args, 'sobol_seed', 0))
+    train_engine = make_sobol_engine(seed + rank)
+    valid_engine = make_sobol_engine(seed + 100000)
+    points_per_step = int(getattr(
+        args, 'sobol_points_per_step',
+        getattr(args, 'sobol_points_per_epoch', 800),
+    ))
+    steps_per_velocity_batch = int(getattr(args, 'sobol_steps_per_velocity_batch', 1))
+    valid_points = draw_sobol_grid_points(
+        valid_engine, getattr(args, 'valid_sobol_points', 800),
+        args.nz, args.nx, args.dh, device,
+    )
+    if is_main_process(rank):
+        print(
+            f"Sobol 模式: 每次更新 {points_per_step} 点, "
+            f"每个 velocity batch 更新 {steps_per_velocity_batch} 次, "
+            f"固定验证 {len(valid_points)} 点, rank 独立训练序列"
+        )
+    return train_engine, valid_points, points_per_step, steps_per_velocity_batch
+
+
+def _draw_sobol_batch(engine, num_pts, args, device, batch_size):
+    points = draw_sobol_grid_points(engine, num_pts, args.nz, args.nx, args.dh, device)
+    return points.unsqueeze(0).expand(batch_size, -1, -1).clone().requires_grad_(True)
+
+
+def _maybe_add_lpips_loss_ddp(args, ddp_model, module, loss, loss_env,
+                              vel_batch, UU0_batch, labels_batch, freq_batch, epoch):
+    """Optionally add LPIPS loss in DDP, using the DDP wrapper for the extra forward."""
+    if not getattr(args, 'use_lpips_loss', False):
+        return loss, loss_env
+    if epoch < int(getattr(args, 'lpips_start_epoch', 0)):
+        return loss, loss_env
+    interval = max(1, int(getattr(args, 'lpips_interval', 1)))
+    if epoch % interval != 0:
+        return loss, loss_env
+
+    y_lpips, h, w = module.make_lpips_grid(vel_batch.shape[0], vel_batch.device)
+    pred = ddp_model(vel_batch, y_lpips, UU0_batch, freq_batch=freq_batch)
+    pred_img = module.pred_to_lpips_image(pred, h, w)
+    target_img = module.labels_to_lpips_image(labels_batch, y_lpips, h, w)
+    loss_lpips = module.lpips_loss_from_images(pred_img, target_img)
+    loss = loss + float(getattr(args, 'lpips_weight', 0.01)) * loss_lpips
+    return loss, loss_lpips
+
+
+def evaluate_valid_loader_ddp(model, loader, coord_loader, device, has_freq,
+                              a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                              use_sobol=False, valid_sobol_points=None):
+    batch_u_loss, batch_f_loss = [], []
+    for batch_data in loader:
+        if has_freq:
+            vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
+            freq_batch = freq_batch.to(device)
+        else:
+            vel_batch, UU0_batch, labels_batch = batch_data
+            freq_batch = None
+        vel_batch = vel_batch.to(device)
+        UU0_batch = UU0_batch.to(device)
+        labels_batch = labels_batch.to(device)
+
+        coord_batches = [valid_sobol_points] if use_sobol else (batch[0] for batch in coord_loader)
+        for y_batch in coord_batches:
+            y_batch = y_batch.to(device)
+            y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
+            _, loss_f_valid, loss_u_valid, _, _ = model.module.loss(
+                vel_batch, y_batch, UU0_batch, labels_batch,
+                a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                freq_batch=freq_batch,
+                apply_frequency_data_weight=False,
+            )
+            batch_u_loss.append(loss_u_valid.item())
+            batch_f_loss.append(loss_f_valid.item())
+
+    return (
+        np.mean(batch_u_loss) if batch_u_loss else 0.0,
+        np.mean(batch_f_loss) if batch_f_loss else 1.0,
+    )
 
 
 def _ddp_lr(args, base_lr, world_size):
@@ -51,6 +137,16 @@ def _ddp_batch_size_v(args, world_size):
 def _ddp_num_workers(args):
     """Per-rank DataLoader workers. Keep modest for 8-16 GPU jobs."""
     return int(getattr(args, 'ddp_num_workers', 2))
+
+
+def _configure_spawn_environment(selected_gpus):
+    """Expose only selected physical GPUs and avoid rendezvous port collisions."""
+    os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(gpu) for gpu in selected_gpus)
+    os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+    if 'MASTER_PORT' not in os.environ:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((os.environ['MASTER_ADDR'], 0))
+            os.environ['MASTER_PORT'] = str(sock.getsockname()[1])
 
 
 def _log_ddp_batch_plan(args, world_size, rank):
@@ -108,10 +204,12 @@ def _train_worker(rank, world_size, args):
     selected_gpus = getattr(args, 'selected_gpus', list(range(world_size)))
     if len(selected_gpus) != world_size:
         raise ValueError(f"selected_gpus 数量 {len(selected_gpus)} 与 world_size {world_size} 不一致")
-    local_device = selected_gpus[rank]
+    physical_device = selected_gpus[rank]
+    local_device = rank
     setup_distributed(rank, world_size, local_device=local_device)
     device = torch.device(f'cuda:{local_device}')
     args.device = local_device  # 确保绘图等函数使用正确的 GPU
+    print(f"[Rank {rank}] 逻辑 GPU {local_device} -> 物理 GPU {physical_device}")
 
     if is_main_process(rank):
         print("=" * 60)
@@ -119,7 +217,7 @@ def _train_worker(rank, world_size, args):
         print(f"GPU 数量: {world_size}")
         print(f"=" * 60)
         os.makedirs(args.save_doc, exist_ok=True)
-    dist.barrier()
+    dist.barrier(device_ids=[local_device])
 
     # ==========================================
     # 加载数据
@@ -206,16 +304,25 @@ def _train_worker(rank, world_size, args):
     # ==========================================
     loss_log, loss_pde_log, loss_data_log, loss_reg_log, loss_env_log = [], [], [], [], []
     valid_u_loss, valid_f_loss = [], []
+    category_valid_u_loss = {name: [] for name in dataloader.get('valid_by_category', {})}
+    category_valid_f_loss = {name: [] for name in dataloader.get('valid_by_category', {})}
 
     # epoch-level 共享 y_ran 采样状态
     epoch_prob = None
     epoch_score = None
 
     a, b, c, d = args.a, args.b, args.c, args.d
+    pde_target_weight = b
     first_flag = True
     pde_norm_coe = 1.
     data_norm_coe = 1.
     env_norm_coe = 1.
+
+    use_sobol = getattr(args, 'sampling_strategy', 'original') == 'sobol'
+    if use_sobol:
+        sobol_engine, valid_sobol_points, sobol_pts, sobol_steps = _init_sobol_sampling(
+            args, device, rank
+        )
 
     # ==========================================
     # 主训练循环
@@ -231,7 +338,10 @@ def _train_worker(rank, world_size, args):
 
     for i in pbar:
         # 动态调整损失权重
-        if args.if_adjust and i > args.adjust_from and (i - args.adjust_from) % args.adjust_every == 0:
+        b = cosine_pde_weight(args, i, pde_target_weight)
+        if (not getattr(args, 'use_pde_weight_ramp', False)
+                and args.if_adjust and i > args.adjust_from
+                and (i - args.adjust_from) % args.adjust_every == 0):
             decay_times = i // args.adjust_every
             a = max(a * (args.adjust_speed ** (-decay_times)), 2e-1)
             b, c = 1, 0
@@ -242,9 +352,8 @@ def _train_worker(rank, world_size, args):
         # 设置 epoch 以确保每个 epoch shuffle 不同
         dataloader['train'].sampler.set_epoch(i)
 
-        # 预收集 coordinate batches（每 epoch 一次，避免在 velocity 循环内重复物化）
-        coord_batches = list(dataloader['train_y'])
-        n_coord = len(coord_batches)
+        # original 路径复用固定 Halton batches；Sobol 路径持续推进准随机序列。
+        coord_batches = list(dataloader['train_y']) if not use_sobol else None
 
         # y_ran: 每 epoch 生成一次（epoch shared 路径）
         y_ran_epoch_shared = None
@@ -299,19 +408,28 @@ def _train_worker(rank, world_size, args):
                 ).clone().requires_grad_(True)
             elif getattr(args, 'use_y_ran', False):
                 with torch.no_grad():
-                    y_ran = model.module.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+                    y_ran = model.module.generate_structure_aware_y_ran(
+                        vel_batch, num_pts=args.y_ran_num_pts
+                    )
             else:
                 y_ran = None
 
-            for idx, batch in enumerate(coord_batches):
-                y_batch = batch[0].to(device)
-                y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
+            sobol_or_halton_batches = range(sobol_steps) if use_sobol else coord_batches
+            for batch in sobol_or_halton_batches:
+                if use_sobol:
+                    y_batch = _draw_sobol_batch(
+                        sobol_engine, sobol_pts, args, device, vel_batch.shape[0]
+                    )
+                else:
+                    y_batch = batch[0].to(device)
+                    y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
 
                 # 拼接数据坐标和 PDE 采样坐标
                 y_combined = torch.cat([y_batch, y_ran], dim=1) if y_ran is not None else y_batch
                 y_combined.requires_grad_(True)
 
-                sync_grad = ((step_counter + 1) % args.accumulation_steps == 0)
+                accumulation_steps = 1 if use_sobol else args.accumulation_steps
+                sync_grad = ((step_counter + 1) % accumulation_steps == 0)
                 sync_context = nullcontext() if sync_grad else model.no_sync()
 
                 with sync_context:
@@ -320,18 +438,23 @@ def _train_worker(rank, world_size, args):
                     loss, loss_f, loss_u, loss_r, loss_env = model.module.compute_loss(
                         Delta_U, vel_batch, y_batch, UU0_batch, labels_batch,
                         y_combined, a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
-                        freq_batch=freq_batch
+                        freq_batch=freq_batch,
+                        epoch=i,
+                    )
+                    loss, loss_env = _maybe_add_lpips_loss_ddp(
+                        args, model, model.module, loss, loss_env,
+                        vel_batch, UU0_batch, labels_batch, freq_batch, i
                     )
 
-                    loss = loss / args.accumulation_steps
+                    loss = loss / accumulation_steps
                     loss.backward()           # all-reduce 在此触发
 
                 step_counter += 1
-                if step_counter % args.accumulation_steps == 0:
+                if step_counter % accumulation_steps == 0:
                     optimizer.step()
                     optimizer.zero_grad()
 
-                batch_loss.append(loss.item() * args.accumulation_steps)
+                batch_loss.append(loss.item() * accumulation_steps)
                 batch_u_loss.append(loss_u.item())
                 batch_f_loss.append(loss_f.item())
                 batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
@@ -374,6 +497,7 @@ def _train_worker(rank, world_size, args):
                 'PDE': f"{loss_pde_log[-1]:.4e}",
                 'Data': f"{loss_data_log[-1]:.4e}",
                 'Env': f"{loss_env_log[-1]:.4e}",
+                'PDE_W': f"{b:.3f}",
                 'LR': f"{current_lr:.2e}",
                 'GPU': f"{world_size}"
             })
@@ -391,32 +515,22 @@ def _train_worker(rank, world_size, args):
         # ==========================================
         if i % args.validate_every == 0 and is_main_process(rank):
             model.eval()
-            batch_u_loss, batch_f_loss = [], []
+            u_loss, f_loss = evaluate_valid_loader_ddp(
+                model, dataloader['valid'], dataloader['valid_y'], device, has_freq,
+                a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                use_sobol, valid_sobol_points if use_sobol else None,
+            )
+            valid_u_loss.append(u_loss)
+            valid_f_loss.append(f_loss)
 
-            for batch_data in dataloader['valid']:
-                if has_freq:
-                    vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
-                    freq_batch = freq_batch.to(device)
-                else:
-                    vel_batch, UU0_batch, labels_batch = batch_data
-                    freq_batch = None
-                vel_batch = vel_batch.to(device)
-                UU0_batch = UU0_batch.to(device)
-                labels_batch = labels_batch.to(device)
-
-                for batch in dataloader['valid_y']:
-                    y_batch = batch[0].to(device)
-                    y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
-
-                    _, loss_f_valid, loss_u_valid, _, _ = model.module.loss(
-                        vel_batch, y_batch, UU0_batch, labels_batch,
-                        a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe, freq_batch=freq_batch
-                    )
-                    batch_u_loss.append(loss_u_valid.item())
-                    batch_f_loss.append(loss_f_valid.item())
-
-            valid_u_loss.append(np.mean(batch_u_loss) if batch_u_loss else 0.0)
-            valid_f_loss.append(np.mean(batch_f_loss) if batch_f_loss else 1.0)
+            for category_name, category_loader in dataloader.get('valid_by_category', {}).items():
+                cat_u_loss, cat_f_loss = evaluate_valid_loader_ddp(
+                    model, category_loader, dataloader['valid_y'], device, has_freq,
+                    a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                    use_sobol, valid_sobol_points if use_sobol else None,
+                )
+                category_valid_u_loss.setdefault(category_name, []).append(cat_u_loss)
+                category_valid_f_loss.setdefault(category_name, []).append(cat_f_loss)
 
         # ==========================================
         # 可视化与绘图 (只在主进程)
@@ -432,6 +546,7 @@ def _train_worker(rank, world_size, args):
             freq_test = plot_data["freq_train"][0:1] if has_freq else None
 
             plot_loss(i, args.save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss)
+            plot_category_valid_loss(i, args.save_doc, category_valid_u_loss, category_valid_f_loss)
 
             if i % (args.save_fig_every * 20) == 0 and i > 0 and args.if_finetune:
                 if ext_val_sets:
@@ -467,11 +582,13 @@ def _train_worker(rank, world_size, args):
             np.save(os.path.join(args.save_doc, 'loss_log.npy'), loss_log)
             np.save(os.path.join(args.save_doc, 'loss_data_log.npy'), loss_data_log)
             np.save(os.path.join(args.save_doc, 'loss_pde_log.npy'), loss_pde_log)
+            np.save(os.path.join(args.save_doc, 'valid_category_data_loss.npy'), category_valid_u_loss)
+            np.save(os.path.join(args.save_doc, 'valid_category_pde_loss.npy'), category_valid_f_loss)
             np.save(os.path.join(args.save_doc, 'loss_env_log.npy'), loss_env_log)
 
         # rank 0 会执行验证、画图和保存；其他 rank 必须等待，否则下一轮 DDP
         # forward/backward 会和 rank 0 的非 DDP 评估流程错位。
-        dist.barrier()
+        dist.barrier(device_ids=[device.index])
 
     # ==========================================
     # 最终保存与清理
@@ -483,6 +600,8 @@ def _train_worker(rank, world_size, args):
             'scheduler_state_dict': scheduler.state_dict(),
         }
         torch.save(checkpoint, os.path.join(args.save_doc, f'{args.filename}_PI_model_final_weights_{args.nz}.pth'))
+        np.save(os.path.join(args.save_doc, 'valid_category_data_loss.npy'), category_valid_u_loss)
+        np.save(os.path.join(args.save_doc, 'valid_category_pde_loss.npy'), category_valid_f_loss)
         print(f"训练完成! 模型已保存到 {args.save_doc}")
 
     cleanup_distributed()
@@ -499,11 +618,15 @@ def train_distributed(args):
     """
     world_size = ddp_world_size_from_args(args)
     args.num_gpus = world_size
+    selected_gpus = getattr(args, 'selected_gpus', list(range(world_size)))
+    _configure_spawn_environment(selected_gpus)
 
     print("=" * 60)
     print(f"启动单机多卡分布式训练")
     print(f"GPU 数量: {world_size}")
-    print(f"GPU 列表: {getattr(args, 'selected_gpus', list(range(world_size)))}")
+    print(f"物理 GPU 列表: {selected_gpus}")
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
+    print(f"MASTER_PORT: {os.environ['MASTER_PORT']}")
     print("=" * 60)
 
     # 使用 mp.spawn 启动多进程
@@ -527,6 +650,8 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
     """DDP 单阶段训练循环"""
     loss_log, loss_pde_log, loss_data_log, loss_reg_log, loss_env_log = [], [], [], [], []
     valid_u_loss, valid_f_loss = [], []
+    category_valid_u_loss = {name: [] for name in dataloader.get('valid_by_category', {})}
+    category_valid_f_loss = {name: [] for name in dataloader.get('valid_by_category', {})}
 
     epoch_prob = None
     epoch_score = None
@@ -540,6 +665,12 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
     step_counter = 0
     scheduler_type = getattr(args, 'scheduler_type', 'plateau')
     use_warmup = getattr(args, 'use_warmup', False)
+    pde_target_weight = b
+    use_sobol = getattr(args, 'sampling_strategy', 'original') == 'sobol'
+    if use_sobol:
+        sobol_engine, valid_sobol_points, sobol_pts, sobol_steps = _init_sobol_sampling(
+            args, device, rank
+        )
 
     if is_main_process(rank):
         pbar = tqdm(range(stage_niter), desc=f"Stage {stage_idx} [{stage_name}]", dynamic_ncols=True)
@@ -547,7 +678,10 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
         pbar = range(stage_niter)
 
     for i in pbar:
-        if args.if_adjust and i > args.adjust_from and (i - args.adjust_from) % args.adjust_every == 0:
+        b = cosine_pde_weight(args, i, pde_target_weight)
+        if (not getattr(args, 'use_pde_weight_ramp', False)
+                and args.if_adjust and i > args.adjust_from
+                and (i - args.adjust_from) % args.adjust_every == 0):
             decay_times = i // args.adjust_every
             a = max(a * (args.adjust_speed ** (-decay_times)), 2e-1)
             b, c = 1, 0
@@ -557,8 +691,7 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
 
         dataloader['train'].sampler.set_epoch(i)
 
-        coord_batches = list(dataloader['train_y'])
-        n_coord = len(coord_batches)
+        coord_batches = list(dataloader['train_y']) if not use_sobol else None
 
         # y_ran: 每 epoch 生成一次（epoch shared 路径）
         y_ran_epoch_shared = None
@@ -611,18 +744,27 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
                 ).clone().requires_grad_(True)
             elif getattr(args, 'use_y_ran', False):
                 with torch.no_grad():
-                    y_ran = model.module.generate_structure_aware_y_ran(vel_batch, num_pts=900)
+                    y_ran = model.module.generate_structure_aware_y_ran(
+                        vel_batch, num_pts=args.y_ran_num_pts
+                    )
             else:
                 y_ran = None
 
-            for idx, batch in enumerate(coord_batches):
-                y_batch = batch[0].to(device)
-                y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
+            sobol_or_halton_batches = range(sobol_steps) if use_sobol else coord_batches
+            for batch in sobol_or_halton_batches:
+                if use_sobol:
+                    y_batch = _draw_sobol_batch(
+                        sobol_engine, sobol_pts, args, device, vel_batch.shape[0]
+                    )
+                else:
+                    y_batch = batch[0].to(device)
+                    y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
 
                 y_combined = torch.cat([y_batch, y_ran], dim=1) if y_ran is not None else y_batch
                 y_combined.requires_grad_(True)
 
-                sync_grad = ((step_counter + 1) % args.accumulation_steps == 0)
+                accumulation_steps = 1 if use_sobol else args.accumulation_steps
+                sync_grad = ((step_counter + 1) % accumulation_steps == 0)
                 sync_context = nullcontext() if sync_grad else model.no_sync()
 
                 with sync_context:
@@ -631,18 +773,23 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
                     loss, loss_f, loss_u, loss_r, loss_env = model.module.compute_loss(
                         Delta_U, vel_batch, y_batch, UU0_batch, labels_batch,
                         y_combined, a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
-                        freq_batch=freq_batch
+                        freq_batch=freq_batch,
+                        epoch=i,
+                    )
+                    loss, loss_env = _maybe_add_lpips_loss_ddp(
+                        args, model, model.module, loss, loss_env,
+                        vel_batch, UU0_batch, labels_batch, freq_batch, i
                     )
 
-                    loss = loss / args.accumulation_steps
+                    loss = loss / accumulation_steps
                     loss.backward()
 
                 step_counter += 1
-                if step_counter % args.accumulation_steps == 0:
+                if step_counter % accumulation_steps == 0:
                     optimizer.step()
                     optimizer.zero_grad()
 
-                batch_loss.append(loss.item() * args.accumulation_steps)
+                batch_loss.append(loss.item() * accumulation_steps)
                 batch_u_loss.append(loss_u.item())
                 batch_f_loss.append(loss_f.item())
                 batch_r_loss.append(loss_r.item() if isinstance(loss_r, torch.Tensor) else loss_r)
@@ -683,6 +830,7 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
                 'PDE': f"{loss_pde_log[-1]:.4e}",
                 'Data': f"{loss_data_log[-1]:.4e}",
                 'Env': f"{loss_env_log[-1]:.4e}",
+                'PDE_W': f"{b:.3f}",
                 'LR': f"{current_lr:.2e}",
                 'GPU': f"{world_size}"
             })
@@ -697,33 +845,22 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
         # ---- 验证 (仅主进程) ----
         if i % args.validate_every == 0 and is_main_process(rank):
             model.eval()
-            vb_u_loss, vb_f_loss = [], []
+            u_loss, f_loss = evaluate_valid_loader_ddp(
+                model, dataloader['valid'], dataloader['valid_y'], device, has_freq,
+                a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                use_sobol, valid_sobol_points if use_sobol else None,
+            )
+            valid_u_loss.append(u_loss)
+            valid_f_loss.append(f_loss)
 
-            for batch_data in dataloader['valid']:
-                if has_freq:
-                    vel_batch, UU0_batch, labels_batch, freq_batch = batch_data
-                    freq_batch = freq_batch.to(device)
-                else:
-                    vel_batch, UU0_batch, labels_batch = batch_data
-                    freq_batch = None
-                vel_batch = vel_batch.to(device)
-                UU0_batch = UU0_batch.to(device)
-                labels_batch = labels_batch.to(device)
-
-                for batch in dataloader['valid_y']:
-                    y_batch = batch[0].to(device)
-                    y_batch = y_batch.unsqueeze(0).expand(vel_batch.shape[0], -1, -1)
-
-                    _, loss_f_valid, loss_u_valid, _, _ = model.module.loss(
-                        vel_batch, y_batch, UU0_batch, labels_batch,
-                        a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
-                        freq_batch=freq_batch
-                    )
-                    vb_u_loss.append(loss_u_valid.item())
-                    vb_f_loss.append(loss_f_valid.item())
-
-            valid_u_loss.append(np.mean(vb_u_loss) if vb_u_loss else 0.0)
-            valid_f_loss.append(np.mean(vb_f_loss) if vb_f_loss else 1.0)
+            for category_name, category_loader in dataloader.get('valid_by_category', {}).items():
+                cat_u_loss, cat_f_loss = evaluate_valid_loader_ddp(
+                    model, category_loader, dataloader['valid_y'], device, has_freq,
+                    a, b, c, d, data_norm_coe, pde_norm_coe, env_norm_coe,
+                    use_sobol, valid_sobol_points if use_sobol else None,
+                )
+                category_valid_u_loss.setdefault(category_name, []).append(cat_u_loss)
+                category_valid_f_loss.setdefault(category_name, []).append(cat_f_loss)
 
         # ---- 可视化 (仅主进程) ----
         if i % args.save_fig_every == 0 and is_main_process(rank):
@@ -738,6 +875,10 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
 
             plot_loss(i, save_doc, loss_log, loss_data_log, loss_pde_log, valid_u_loss, valid_f_loss,
                       suffix=f'_stage{stage_idx}')
+            plot_category_valid_loss(
+                i, save_doc, category_valid_u_loss, category_valid_f_loss,
+                suffix=f'_stage{stage_idx}'
+            )
 
             test_plot(args, model.module, fno, i, dataloader["pred"],
                       vel_pred, UU0_pred, labels_pred, f'valid_stage{stage_idx}',
@@ -767,7 +908,7 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
             np.save(os.path.join(save_doc, f'loss_env_log_stage{stage_idx}.npy'), loss_env_log)
 
         # rank 0 阶段验证/画图/保存期间，其他 rank 等待，避免 DDP collective 错位。
-        dist.barrier()
+        dist.barrier(device_ids=[device.index])
 
     # ---- 阶段结束：保存最终权重 ----
     if is_main_process(rank):
@@ -782,6 +923,8 @@ def _run_stage_training_loop(args, model, fno, device, rank, world_size,
         np.save(os.path.join(save_doc, f'loss_data_log_stage{stage_idx}.npy'), loss_data_log)
         np.save(os.path.join(save_doc, f'loss_pde_log_stage{stage_idx}.npy'), loss_pde_log)
         np.save(os.path.join(save_doc, f'loss_env_log_stage{stage_idx}.npy'), loss_env_log)
+        np.save(os.path.join(save_doc, f'valid_category_data_loss_stage{stage_idx}.npy'), category_valid_u_loss)
+        np.save(os.path.join(save_doc, f'valid_category_pde_loss_stage{stage_idx}.npy'), category_valid_f_loss)
 
     return model
 
@@ -836,7 +979,7 @@ def _train_stage_ddp(args, model, fno, device, rank, world_size,
                 model.module.load_state_dict(ckpt['model_state_dict'])
             else:
                 print(f'⚠️ 未找到上一阶段权重: {prev_path}，将使用当前模型权重继续')
-        dist.barrier()
+        dist.barrier(device_ids=[device.index])
         for param in model.module.parameters():
             dist.broadcast(param.data, src=0)
     else:
@@ -991,10 +1134,12 @@ def _train_worker_staged(rank, world_size, args):
     selected_gpus = getattr(args, 'selected_gpus', list(range(world_size)))
     if len(selected_gpus) != world_size:
         raise ValueError(f"selected_gpus 数量 {len(selected_gpus)} 与 world_size {world_size} 不一致")
-    local_device = selected_gpus[rank]
+    physical_device = selected_gpus[rank]
+    local_device = rank
     setup_distributed(rank, world_size, local_device=local_device)
     device = torch.device(f'cuda:{local_device}')
     args.device = local_device
+    print(f"[Rank {rank}] 逻辑 GPU {local_device} -> 物理 GPU {physical_device}")
 
     # 创建模型（全局一次，跨阶段复用）
     model = Pi_DeepONet(args).to(device)
@@ -1020,7 +1165,7 @@ def _train_worker_staged(rank, world_size, args):
     save_doc = args.save_doc
     if is_main_process(rank):
         os.makedirs(save_doc, exist_ok=True)
-    dist.barrier()
+    dist.barrier(device_ids=[local_device])
 
     base_vel_filename = args.vel_filename
     base_bg_filename = args.backgroundfield_filename
@@ -1054,12 +1199,16 @@ def train_distributed_staged(args):
     """单机多卡分布式 + 课程学习训练入口函数"""
     world_size = ddp_world_size_from_args(args)
     args.num_gpus = world_size
+    selected_gpus = getattr(args, 'selected_gpus', list(range(world_size)))
+    _configure_spawn_environment(selected_gpus)
 
     stages = getattr(args, 'stages', [])
     print("=" * 60)
     print(f"启动单机多卡分布式课程学习训练")
     print(f"GPU 数量: {world_size}")
-    print(f"GPU 列表: {getattr(args, 'selected_gpus', list(range(world_size)))}")
+    print(f"物理 GPU 列表: {selected_gpus}")
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
+    print(f"MASTER_PORT: {os.environ['MASTER_PORT']}")
     print(f"训练阶段数: {len(stages)}")
     for si, s in enumerate(stages):
         print(f'  Stage {si}: {s["name"]} | freq [{s["freq_min"]}-{s["freq_max"]}] Hz | '

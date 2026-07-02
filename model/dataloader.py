@@ -1,5 +1,6 @@
 from Labconfig import *
 from model.utils import Halton_Sample
+import json
 
 
 
@@ -144,34 +145,515 @@ def Test_data_single(args, loc_idx, vel_single, UU_loc_single, UU0_loc_single):
     # 返回参数顺序与原函数保持一致
     return vel_test, u_current, u0_current, y_test, labels_test
 
-def load_tensor_from_npy(base_path, filename):
-    """通用的数据读取鲁棒接口"""
+def resolve_npy_path(base_path, filename):
     path = os.path.join(base_path, filename)
     if not os.path.exists(path):
         path = filename  # Fallback
+    return path
+
+
+def load_tensor_from_npy(base_path, filename):
+    """通用的数据读取鲁棒接口"""
+    path = resolve_npy_path(base_path, filename)
     return torch.tensor(np.load(path), dtype=torch.float32)
+
+
+def load_npy_mmap(base_path, filename):
+    path = resolve_npy_path(base_path, filename)
+    return np.load(path, mmap_mode='r')
+
+
+def make_coordinate_grid(args, nz, nx):
+    spatial_step = args.dh
+    if getattr(args, 'sampling_mode', 'full_grid') == 'halton':
+        total_pts = nz * nx
+        ratio = getattr(args, 'halton_sample_ratio', 0.2)
+        num_pts = max(1, int(total_pts * ratio))
+        halton_indices = Halton_Sample((nz, nx), num_pts)
+        z_idx = torch.tensor([p[0] for p in halton_indices], dtype=torch.float32)
+        x_idx = torch.tensor([p[1] for p in halton_indices], dtype=torch.float32)
+        y_grid = torch.stack([z_idx, x_idx], dim=1) * spatial_step
+        print(f'[Halton] 采样点数: {num_pts}, y shape: {y_grid.shape}')
+        return y_grid
+
+    x_c = torch.arange(0, nx)
+    z_c = torch.arange(0, nz)
+    grid_z, grid_x = torch.meshgrid(z_c, x_c, indexing='ij')
+    return torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1).float() * spatial_step
+
+
+def make_full_coordinate_grid(args, nz, nx):
+    x_c = torch.arange(0, nx)
+    z_c = torch.arange(0, nz)
+    grid_z, grid_x = torch.meshgrid(z_c, x_c, indexing='ij')
+    return torch.stack([grid_z.flatten(), grid_x.flatten()], dim=1).float() * args.dh
+
+
+def get_pml_slices(args):
+    if not args.pml:
+        return slice(None), slice(None)
+
+    pml_crop = args.pml_crop
+    if args.boundary_type == 'free_surface':
+        z_slice = slice(0, -pml_crop)
+    else:
+        z_slice = slice(pml_crop, -pml_crop)
+    x_slice = slice(pml_crop, -pml_crop)
+    return z_slice, x_slice
+
+
+def read_multifreq_split(vel_np, uu0_np, uu_np, freq_np, flat_indices, source_list, z_slice, x_slice):
+    n_freq = vel_np.shape[1]
+    vel_ids = flat_indices // n_freq
+    freq_ids = flat_indices % n_freq
+
+    base_vel = torch.from_numpy(np.asarray(
+        vel_np[vel_ids, freq_ids, z_slice, x_slice], dtype=np.float32
+    )).unsqueeze(1)
+    base_freq = torch.from_numpy(np.asarray(freq_np[vel_ids, freq_ids], dtype=np.float32))
+
+    u0_list, label_list = [], []
+    for src in source_list:
+        u0_src = torch.from_numpy(np.asarray(
+            uu0_np[vel_ids, freq_ids, src, :, z_slice, x_slice], dtype=np.float32
+        ))
+        label_src = torch.from_numpy(np.asarray(
+            uu_np[vel_ids, freq_ids, src, :, z_slice, x_slice], dtype=np.float32
+        ))
+        label_src.sub_(u0_src)
+        u0_list.append(u0_src)
+        label_list.append(label_src)
+
+    n_src_selected = len(source_list)
+    vel_out = base_vel.repeat(n_src_selected, 1, 1, 1)
+    freq_out = base_freq.repeat(n_src_selected)
+    uu0_out = torch.cat(u0_list, dim=0)
+    labels_out = torch.cat(label_list, dim=0)
+    return vel_out, uu0_out, labels_out, freq_out
+
+
+def read_multifreq_samples(vel_np, uu0_np, uu_np, freq_np, vel_ids, freq_ids, source_ids, z_slice, x_slice):
+    vel_ids = np.asarray(vel_ids, dtype=np.int64)
+    freq_ids = np.asarray(freq_ids, dtype=np.int64)
+    source_ids = np.asarray(source_ids, dtype=np.int64)
+    if not (len(vel_ids) == len(freq_ids) == len(source_ids)):
+        raise ValueError(
+            f'采样索引长度不一致: vel={len(vel_ids)}, freq={len(freq_ids)}, source={len(source_ids)}'
+        )
+
+    vel_out = torch.from_numpy(np.asarray(
+        vel_np[vel_ids, freq_ids, z_slice, x_slice], dtype=np.float32
+    )).unsqueeze(1)
+    freq_out = torch.from_numpy(np.asarray(freq_np[vel_ids, freq_ids], dtype=np.float32))
+    uu0_out = torch.from_numpy(np.asarray(
+        uu0_np[vel_ids, freq_ids, source_ids, :, z_slice, x_slice], dtype=np.float32
+    ))
+    labels_out = torch.from_numpy(np.asarray(
+        uu_np[vel_ids, freq_ids, source_ids, :, z_slice, x_slice], dtype=np.float32
+    ))
+    labels_out.sub_(uu0_out)
+    return vel_out, uu0_out, labels_out, freq_out
+
+
+def random_one_freq_source_indices(base_indices, n_freq, source_list, rng):
+    base_indices = np.asarray(base_indices, dtype=np.int64)
+    freq_ids = rng.integers(0, n_freq, size=len(base_indices), dtype=np.int64)
+    source_choices = np.asarray(source_list, dtype=np.int64)
+    source_ids = rng.choice(source_choices, size=len(base_indices), replace=True)
+    return base_indices, freq_ids, source_ids
+
+
+def load_category_metadata(args, n_base):
+    data_dir = os.path.dirname(resolve_npy_path(args.load_path, args.vel_filename))
+    category_path = os.path.join(data_dir, 'model_category.npy')
+    names_path = os.path.join(data_dir, 'category_names.json')
+    if os.path.exists(category_path):
+        model_category = np.load(category_path, mmap_mode='r')
+    else:
+        model_category = np.zeros(n_base, dtype=np.int64)
+
+    if os.path.exists(names_path):
+        with open(names_path, 'r', encoding='utf-8') as f:
+            raw_names = json.load(f)
+        category_names = [raw_names[str(i)] for i in range(len(raw_names))]
+    else:
+        category_names = ['all']
+
+    return model_category, category_names
+
+
+def selected_category_ids(args, category_names):
+    category_filter = getattr(args, 'category_filter', None)
+    if category_filter is None:
+        return list(range(len(category_names)))
+
+    if isinstance(category_filter, (str, int)):
+        category_filter = [category_filter]
+
+    name_to_id = {name: idx for idx, name in enumerate(category_names)}
+    ids = []
+    for item in category_filter:
+        if isinstance(item, str):
+            if item not in name_to_id:
+                raise ValueError(f'未知类别 {item}, 可用类别: {sorted(name_to_id)}')
+            ids.append(name_to_id[item])
+        else:
+            ids.append(int(item))
+    return ids
+
+
+def count_for_category(config_value, category_name, default_value):
+    if isinstance(config_value, dict):
+        if category_name in config_value:
+            return int(config_value[category_name])
+        return int(default_value)
+    if config_value is None:
+        return int(default_value)
+    return int(config_value)
+
+
+def base_to_flat_indices(base_indices, n_freq):
+    base_indices = np.asarray(base_indices, dtype=np.int64)
+    return (base_indices[:, None] * n_freq + np.arange(n_freq)[None, :]).reshape(-1).astype(np.int64)
+
+
+def base_to_filtered_flat_indices(base_indices, freq_np, frequency_filter=None):
+    """Expand velocity ids to flattened velocity-frequency ids, optionally filtering frequency values."""
+    base_indices = np.asarray(base_indices, dtype=np.int64)
+    n_freq = freq_np.shape[1]
+    if frequency_filter is None:
+        return base_to_flat_indices(base_indices, n_freq)
+
+    if np.isscalar(frequency_filter):
+        frequency_filter = [frequency_filter]
+    mask = np.isin(np.asarray(freq_np[base_indices]), np.asarray(frequency_filter, dtype=np.float32))
+    local_vel_ids, freq_ids = np.where(mask)
+    if len(local_vel_ids) == 0:
+        raise ValueError(
+            f'速度模型 {base_indices.tolist()} 中不存在 frequency_filter={list(frequency_filter)}'
+        )
+    return (base_indices[local_vel_ids] * n_freq + freq_ids).astype(np.int64)
+
+
+def make_field_loader(vel, uu0, labels, freq, batch_size, shuffle, drop_last):
+    dataset = TensorDataset(vel, uu0, labels, freq)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        pin_memory=False,
+        num_workers=0,
+    )
+
+
+def configure_frequency_data_weight(args, freq_train):
+    """Precompute the target mean weight over the whole training split."""
+    if freq_train is None or not getattr(args, 'use_frequency_data_weight', False):
+        return
+
+    start_hz = float(getattr(args, 'frequency_data_weight_start_hz', 12.0))
+    end_hz = float(getattr(args, 'frequency_data_weight_end_hz', 25.0))
+    max_weight = float(getattr(args, 'frequency_data_weight_max', 1.0))
+    if max_weight <= 1.0 or end_hz <= start_hz:
+        setattr(args, 'frequency_data_weight_target_mean', 1.0)
+        return
+
+    freq = freq_train.float()
+    progress = ((freq - start_hz) / (end_hz - start_hz)).clamp(0.0, 1.0)
+    raw_weight = 1.0 + (max_weight - 1.0) * 0.5 * (1.0 - torch.cos(progress * torch.pi))
+    target_mean = float(raw_weight.mean().item())
+    setattr(args, 'frequency_data_weight_target_mean', max(target_mean, 1e-8))
+    print(
+        f'固定频率 DataLoss 权重: start={start_hz:g}Hz, end={end_hz:g}Hz, '
+        f'max={max_weight:g}, target_mean={target_mean:.4f}'
+    )
+
+
+def prepare_multifreq_training_dataloaders(args, vel_np, uu0_np, uu_np, freq_np):
+    """
+    新数据格式:
+      velocity: [nvel, n_freq, Z, X]
+      background/wavefield: [nvel, n_freq, n_source, 2, Z, X]
+      freq: [nvel, n_freq]
+
+    训练样本单位为 (velocity_id, freq_id, source_id)，其中 source_id 由 args.source_list 控制。
+    """
+    if uu0_np.shape != uu_np.shape:
+        raise ValueError(f'background shape {uu0_np.shape} != wavefield shape {uu_np.shape}')
+    if vel_np.ndim != 4 or uu0_np.ndim != 6 or freq_np.ndim != 2:
+        raise ValueError(
+            f'新格式维度不匹配: velocity={vel_np.shape}, background={uu0_np.shape}, freq={freq_np.shape}'
+        )
+    if vel_np.shape[:2] != uu0_np.shape[:2] or vel_np.shape[:2] != freq_np.shape:
+        raise ValueError(
+            f'速度/波场/频率前两维不一致: velocity={vel_np.shape}, background={uu0_np.shape}, freq={freq_np.shape}'
+        )
+
+    z_slice, x_slice = get_pml_slices(args)
+    n_base, n_freq = vel_np.shape[:2]
+    n_src = uu0_np.shape[2]
+    source_list = list(getattr(args, 'source_list', [0]))
+    for src in source_list:
+        if src < 0 or src >= n_src:
+            raise ValueError(f'source_list 包含非法震源 {src}, 可用范围: 0-{n_src - 1}')
+
+    valid_source_cfg = getattr(args, 'valid_source_list', None)
+    valid_source_list = source_list if valid_source_cfg is None else list(valid_source_cfg)
+    test_source_list = list(getattr(args, 'test_source_list', list(range(n_src))))
+    for src_group_name, src_group in [('valid_source_list', valid_source_list), ('test_source_list', test_source_list)]:
+        for src in src_group:
+            if src < 0 or src >= n_src:
+                raise ValueError(f'{src_group_name} 包含非法震源 {src}, 可用范围: 0-{n_src - 1}')
+
+    sample_shape = vel_np[0, 0, z_slice, x_slice].shape
+    args.nz, args.nx = sample_shape
+
+    model_category, category_names = load_category_metadata(args, n_base)
+    active_category_ids = selected_category_ids(args, category_names)
+    n_train_cfg = getattr(args, 'nvel_train_per_category', None)
+    if n_train_cfg is None:
+        n_train_cfg = max(1, int(getattr(args, 'nvel_train', n_base) / max(1, len(active_category_ids))))
+    n_valid_cfg = getattr(args, 'nvel_valid_per_category', None)
+
+    rng = np.random.default_rng(1)
+    train_flat_parts = []
+    valid_flat_parts = []
+    category_valid_tensors = {}
+    category_test_tensors = {}
+    split_summary = {}
+    valid_random_one_freq = getattr(args, 'valid_random_one_freq', True)
+    valid_random_one_source = getattr(args, 'valid_random_one_source', True)
+    frequency_filter = getattr(args, 'frequency_filter', None)
+    velocity_mode = getattr(args, 'velocity_mode', 'multi')
+    if velocity_mode not in ('single', 'multi'):
+        raise ValueError(f"velocity_mode 必须是 'single' 或 'multi', 当前为: {velocity_mode}")
+    if velocity_mode == 'single':
+        explicit_train_base = getattr(args, 'train_velocity_indices', None)
+        explicit_valid_base = getattr(args, 'valid_velocity_indices', None)
+        if explicit_train_base is None or explicit_valid_base is None:
+            raise ValueError("velocity_mode='single' 时必须设置 train_velocity_indices 和 valid_velocity_indices")
+    else:
+        explicit_train_base = None
+        explicit_valid_base = None
+    if explicit_train_base is not None:
+        explicit_train_base = np.asarray(explicit_train_base, dtype=np.int64)
+    if explicit_valid_base is not None:
+        explicit_valid_base = np.asarray(explicit_valid_base, dtype=np.int64)
+
+    for category_id in active_category_ids:
+        category_name = category_names[category_id]
+        base_indices = np.where(model_category == category_id)[0]
+
+        if explicit_train_base is not None:
+            train_base = explicit_train_base[np.isin(explicit_train_base, base_indices)]
+            if len(train_base) == 0:
+                continue
+            invalid = explicit_train_base[~np.isin(explicit_train_base, np.arange(n_base))]
+            if len(invalid) > 0:
+                raise ValueError(f'train_velocity_indices 越界: {invalid.tolist()}')
+            if explicit_valid_base is None:
+                raise ValueError('设置 train_velocity_indices 时必须同时设置 valid_velocity_indices')
+            valid_base = explicit_valid_base[np.isin(explicit_valid_base, base_indices)]
+            if len(valid_base) == 0:
+                raise ValueError(f'类别 {category_name} 中没有有效的 valid_velocity_indices')
+            if np.intersect1d(train_base, valid_base).size > 0:
+                raise ValueError('train_velocity_indices 与 valid_velocity_indices 不能重叠')
+        else:
+            n_train_cat = count_for_category(n_train_cfg, category_name, 0)
+            if n_train_cat <= 0:
+                continue
+            if n_train_cat >= len(base_indices):
+                raise ValueError(
+                    f'类别 {category_name} 只有 {len(base_indices)} 个速度模型, '
+                    f'nvel_train_per_category={n_train_cat} 不应全部用完'
+                )
+            n_valid_default = int(getattr(args, 'valid_rate', 0.1) * n_train_cat) + 1
+            n_valid_cat = count_for_category(n_valid_cfg, category_name, n_valid_default)
+            if n_train_cat + n_valid_cat > len(base_indices):
+                raise ValueError(
+                    f'类别 {category_name} 训练+验证需要 {n_train_cat + n_valid_cat} 个速度模型, '
+                    f'但只有 {len(base_indices)} 个'
+                )
+            shuffled = rng.permutation(base_indices)
+            train_base = shuffled[:n_train_cat]
+            valid_base = shuffled[n_train_cat:n_train_cat + n_valid_cat]
+
+        train_flat_cat = base_to_filtered_flat_indices(train_base, freq_np, frequency_filter)
+        train_flat_parts.append(train_flat_cat)
+
+        if valid_random_one_freq and valid_random_one_source:
+            if frequency_filter is not None:
+                raise ValueError('设置 frequency_filter 时请将 valid_random_one_freq=False')
+            valid_vel_ids, valid_freq_ids, valid_source_ids = random_one_freq_source_indices(
+                valid_base, n_freq, valid_source_list, rng
+            )
+            category_valid_tensors[category_name] = read_multifreq_samples(
+                vel_np, uu0_np, uu_np, freq_np,
+                valid_vel_ids, valid_freq_ids, valid_source_ids,
+                z_slice, x_slice,
+            )
+            valid_flat_cat = valid_vel_ids * n_freq + valid_freq_ids
+            valid_flat_parts.append((valid_vel_ids, valid_freq_ids, valid_source_ids))
+            valid_vf_count = len(valid_vel_ids)
+        else:
+            valid_flat_cat = base_to_filtered_flat_indices(valid_base, freq_np, frequency_filter)
+            category_valid_tensors[category_name] = read_multifreq_split(
+                vel_np, uu0_np, uu_np, freq_np, valid_flat_cat, valid_source_list, z_slice, x_slice
+            )
+            valid_flat_parts.append(valid_flat_cat)
+            valid_vf_count = len(valid_flat_cat)
+
+        category_test_tensors[category_name] = read_multifreq_split(
+            vel_np, uu0_np, uu_np, freq_np, valid_flat_cat, test_source_list, z_slice, x_slice
+        )
+        split_summary[category_name] = {
+            'train_velocity': int(len(train_base)),
+            'valid_velocity': int(len(valid_base)),
+            'train_velocity_frequency': int(len(train_flat_cat)),
+            'valid_velocity_frequency': int(valid_vf_count),
+        }
+
+    if not train_flat_parts:
+        raise ValueError('没有可用训练类别，请检查 category_filter 和 nvel_train_per_category')
+
+    train_flat = rng.permutation(np.concatenate(train_flat_parts))
+    if valid_random_one_freq and valid_random_one_source:
+        valid_vel_ids = np.concatenate([part[0] for part in valid_flat_parts])
+        valid_freq_ids = np.concatenate([part[1] for part in valid_flat_parts])
+        valid_source_ids = np.concatenate([part[2] for part in valid_flat_parts])
+    else:
+        valid_flat = np.concatenate(valid_flat_parts)
+
+    vel_train, UU0_train, labels_train, freq_train = read_multifreq_split(
+        vel_np, uu0_np, uu_np, freq_np, train_flat, source_list, z_slice, x_slice
+    )
+    if valid_random_one_freq and valid_random_one_source:
+        vel_valid, UU0_valid, labels_valid, freq_valid = read_multifreq_samples(
+            vel_np, uu0_np, uu_np, freq_np,
+            valid_vel_ids, valid_freq_ids, valid_source_ids,
+            z_slice, x_slice,
+        )
+    else:
+        vel_valid, UU0_valid, labels_valid, freq_valid = read_multifreq_split(
+            vel_np, uu0_np, uu_np, freq_np, valid_flat, valid_source_list, z_slice, x_slice
+        )
+
+    vel_train = vel_train / 1000.
+    vel_valid = vel_valid / 1000.
+    configure_frequency_data_weight(args, freq_train)
+    y_train = make_coordinate_grid(args, args.nz, args.nx)
+    y_valid = y_train
+
+    print('新多频数据格式:')
+    print(f'  velocity: {vel_np.shape}, background/wavefield: {uu0_np.shape}, freq: {freq_np.shape}')
+    print(f'  velocity_mode: {velocity_mode}')
+    print(f'  train source_list: {source_list}, valid_source_list: {valid_source_list}, test_source_list: {test_source_list}')
+    print(f'  frequency_filter: {frequency_filter}')
+    if explicit_train_base is not None:
+        print(f'  fixed velocity split: train={explicit_train_base.tolist()}, valid={explicit_valid_base.tolist()}')
+    print(f'  valid random one freq/source: {valid_random_one_freq and valid_random_one_source}')
+    for category_name, info in split_summary.items():
+        print(
+            f'  {category_name}: train_vel={info["train_velocity"]}, '
+            f'valid_vel={info["valid_velocity"]}, '
+            f'train_vf={info["train_velocity_frequency"]}, valid_vf={info["valid_velocity_frequency"]}'
+        )
+    print(f'  train: vel={vel_train.shape}, UU0={UU0_train.shape}, labels={labels_train.shape}, freq={freq_train.shape}')
+    print(f'  valid: vel={vel_valid.shape}, UU0={UU0_valid.shape}, labels={labels_valid.shape}, freq={freq_valid.shape}')
+
+    hf_test_idx = freq_train.argmax().item()
+    hf_pred_idx = freq_valid.argmax().item()
+    vel_pred = vel_valid[hf_pred_idx:hf_pred_idx + 1]
+    UU0_pred = UU0_valid[hf_pred_idx:hf_pred_idx + 1]
+    labels_pred = labels_valid[hf_pred_idx:hf_pred_idx + 1]
+    vel_test = vel_train[hf_test_idx:hf_test_idx + 1]
+    UU0_test = UU0_train[hf_test_idx:hf_test_idx + 1]
+    labels_test = labels_train[hf_test_idx:hf_test_idx + 1]
+
+    y_pred = make_full_coordinate_grid(args, args.nz, args.nx)
+    y_test = y_pred
+
+    train_loaders = {
+        "train": make_field_loader(
+            vel_train, UU0_train, labels_train, freq_train,
+            args.batch_size_v, shuffle=True, drop_last=True,
+        ),
+        "train_y": DataLoader(TensorDataset(y_train),
+                              batch_size=args.batch_size, shuffle=True, pin_memory=False,
+                              num_workers=0),
+        "valid": make_field_loader(
+            vel_valid, UU0_valid, labels_valid, freq_valid,
+            args.valid_batch_size_v, shuffle=False, drop_last=False,
+        ),
+        "valid_y": DataLoader(TensorDataset(y_valid),
+                              batch_size=args.valid_batch_size, shuffle=True, pin_memory=False,
+                              num_workers=0),
+        "pred": DataLoader(TensorDataset(y_pred), batch_size=args.batch_size, shuffle=False),
+        "test": DataLoader(TensorDataset(y_test), batch_size=args.batch_size, shuffle=False)
+    }
+    train_loaders["valid_by_category"] = {}
+    for category_name, tensors in category_valid_tensors.items():
+        v_cat, u0_cat, lab_cat, f_cat = tensors
+        v_cat = v_cat / 1000.
+        train_loaders["valid_by_category"][category_name] = make_field_loader(
+            v_cat, u0_cat, lab_cat, f_cat,
+            args.valid_batch_size_v, shuffle=False, drop_last=False,
+        )
+        train_loaders[f"valid_{category_name}"] = train_loaders["valid_by_category"][category_name]
+
+    plot_data = {
+        "vel_pred": vel_pred, "UU0_pred": UU0_pred, "labels_pred": labels_pred,
+        "vel_test": vel_test, "UU0_test": UU0_test, "labels_test": labels_test,
+        "y_pred": y_pred,
+        "freq_train": freq_train[hf_test_idx:hf_test_idx + 1],
+        "freq_valid": freq_valid[hf_pred_idx:hf_pred_idx + 1],
+        "valid_by_category": train_loaders["valid_by_category"],
+        "test_by_category": {},
+        "split_summary": split_summary,
+        "has_freq": True,
+    }
+    for category_name, tensors in category_test_tensors.items():
+        v_cat, u0_cat, lab_cat, f_cat = tensors
+        plot_data["test_by_category"][category_name] = {
+            "vel": v_cat / 1000.,
+            "UU0": u0_cat,
+            "labels": lab_cat,
+            "freq": f_cat,
+            "source_list": test_source_list,
+        }
+    return train_loaders, plot_data
 
 def prepare_training_dataloaders(args, device):
     """
     仅处理用于模型训练和内部验证的数据流
     """
-    # 1. 基础训练数据读取
-    vel_original = load_tensor_from_npy(args.load_path, args.vel_filename)
-    UU0_original = load_tensor_from_npy(args.load_path, args.backgroundfield_filename)
-    UU_original = load_tensor_from_npy(args.load_path, args.wavefield_filename)
+    # 1. 基础训练数据读取。先用 mmap 探测 shape，避免新格式大数组一次性读入内存。
+    vel_np = load_npy_mmap(args.load_path, args.vel_filename)
+    UU0_np = load_npy_mmap(args.load_path, args.backgroundfield_filename)
+    UU_np = load_npy_mmap(args.load_path, args.wavefield_filename)
 
     # 加载频率数据（若文件存在）
     freq_filename = getattr(args, 'freq_filename', None)
     if freq_filename:
-        freq_path = os.path.join(args.load_path, freq_filename)
+        freq_path = resolve_npy_path(args.load_path, freq_filename)
         if os.path.exists(freq_path):
-            freq = torch.tensor(np.load(freq_path), dtype=torch.float32)
-            print(f'已加载频率数据: {freq_filename}, shape: {freq.shape}, 唯一值: {freq.unique().tolist()}')
+            freq_np = np.load(freq_path, mmap_mode='r')
+            print(f'已加载频率数据: {freq_filename}, shape: {freq_np.shape}, 唯一值: {np.unique(freq_np).tolist()}')
         else:
             print(f'⚠️ 频率文件不存在: {freq_path}，将使用默认频率')
-            freq = None
+            freq_np = None
     else:
-        freq = None
+        freq_np = None
+
+    if vel_np.ndim == 4 and UU0_np.ndim == 6 and UU_np.ndim == 6 and freq_np is not None:
+        return prepare_multifreq_training_dataloaders(args, vel_np, UU0_np, UU_np, freq_np)
+
+    # 旧格式兜底：保持原有逻辑
+    vel_original = torch.tensor(np.asarray(vel_np), dtype=torch.float32)
+    UU0_original = torch.tensor(np.asarray(UU0_np), dtype=torch.float32)
+    UU_original = torch.tensor(np.asarray(UU_np), dtype=torch.float32)
+    freq = torch.tensor(np.asarray(freq_np), dtype=torch.float32) if freq_np is not None else None
 
     # 2. PML 边界处理
     if args.pml:
@@ -219,6 +701,7 @@ def prepare_training_dataloaders(args, device):
     # 4. 物理场归一化
     vel_train = vel_train / 1000.
     vel_valid = vel_valid / 1000.
+    configure_frequency_data_weight(args, freq_train)
 
     # 绘图示例: 选取高频样本 (freq 值最大的样本)
     if freq_train is not None:

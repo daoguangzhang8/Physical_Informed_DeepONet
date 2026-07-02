@@ -15,6 +15,7 @@ scipy>=1.13
 matplotlib>=3.9
 h5py>=3.8
 tqdm>=4.60
+lpips>=0.1.4
 
 # Data generation scripts in data_generation/ use scipy sparse solvers,
 # scipy.io, scipy.ndimage, numpy, and matplotlib; they are covered above.

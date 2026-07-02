@@ -110,7 +110,20 @@ class ArgsTest:
     # ==========================================
     # 5.5 网络架构 (Architecture)
     # ==========================================
-    branch2_type = 'conv'                     # Branch2 架构: 'fno' | 'resnet' | 'conv'
+    branch1_modes = 12                        # 会根据 checkpoint 自动覆盖
+    branch1_width = 32                        # 会根据 checkpoint 自动覆盖
+    branch2_type = 'conv'                     # Branch2 架构: 'hybrid' | 'fno' | 'resnet' | 'conv'
+    branch2_modes = 32                        # 会根据 checkpoint 自动覆盖
+    branch2_width = 32                        # 会根据 checkpoint 自动覆盖
+    branch2_global_modes = 32
+    branch2_global_width = 32
+    branch2_local_type = 'conv'
+    branch2_freq_gate_norm_hz = 25.0
+    use_kpe = False
+    use_trunk_freq_encoding = False           # 会根据 checkpoint 自动覆盖
+    trunk_freq_embed_dim = 8
+    trunk_freq_num_bands = 3
+    trunk_freq_norm_hz = 25.0
 
     # ==========================================
     # 6. 评估与批处理配置 (Evaluation & Batch)
@@ -237,13 +250,76 @@ def infer_branch2_type_from_checkpoint(model_path, device):
     """根据 checkpoint key 自动识别 branch2 架构，兼容旧实验输出目录。"""
     state_dict = checkpoint_state_dict(model_path, device)
     keys = [key.replace('module.', '', 1) for key in state_dict.keys()]
+    if any(key.startswith('branch2_global.') for key in keys):
+        return 'hybrid'
     if any(key.startswith('branch2.0.fc0.') for key in keys):
         return 'fno'
+    if any(key.startswith('branch2.net.12.') for key in keys):
+        return 'conv_deep'
     if any(key.startswith('branch2.net.') for key in keys):
         return 'conv'
     if any(key.startswith('branch2.stem.') or key.startswith('branch2.blocks.') for key in keys):
         return 'resnet'
     return None
+
+
+def infer_branch1_config_from_checkpoint(model_path, device):
+    """根据 checkpoint tensor shape 自动识别 branch1 FNO 的 modes/width。"""
+    state_dict = checkpoint_state_dict(model_path, device)
+    normalized = {key.replace('module.', '', 1): value for key, value in state_dict.items()}
+    config = {}
+
+    fc0_weight = normalized.get('branch1.0.fc0.weight')
+    if fc0_weight is not None:
+        config['branch1_width'] = int(fc0_weight.shape[0])
+
+    spectral_weight = normalized.get('branch1.0.conv1.weights1')
+    if spectral_weight is not None and spectral_weight.ndim >= 4:
+        config['branch1_modes'] = int(spectral_weight.shape[2])
+
+    return config
+
+
+def infer_branch2_fno_config_from_checkpoint(model_path, device):
+    """根据 checkpoint tensor shape 自动识别 branch2 FNO 的 modes/width。"""
+    state_dict = checkpoint_state_dict(model_path, device)
+    normalized = {key.replace('module.', '', 1): value for key, value in state_dict.items()}
+    config = {}
+
+    fc0_weight = normalized.get('branch2.0.fc0.weight')
+    if fc0_weight is not None:
+        config['branch2_width'] = int(fc0_weight.shape[0])
+
+    spectral_weight = normalized.get('branch2.0.conv1.weights1')
+    if spectral_weight is not None and spectral_weight.ndim >= 4:
+        config['branch2_modes'] = int(spectral_weight.shape[2])
+
+    return config
+
+
+def infer_trunk_config_from_checkpoint(model_path, device):
+    """根据 trunk.fc1 输入维度自动识别是否启用了显式频率编码。"""
+    state_dict = checkpoint_state_dict(model_path, device)
+    normalized = {key.replace('module.', '', 1): value for key, value in state_dict.items()}
+    config = {}
+
+    fc1_weight = normalized.get('trunk.fc1.weight')
+    if fc1_weight is None or fc1_weight.ndim != 2:
+        return config
+
+    input_dim = int(fc1_weight.shape[1])
+    if input_dim > 16:
+        config['use_trunk_freq_encoding'] = True
+        config['trunk_freq_embed_dim'] = input_dim - 16
+        freq_weight = normalized.get('trunk_freq_encoder.0.weight')
+        if freq_weight is not None and freq_weight.ndim == 2:
+            freq_feature_dim = int(freq_weight.shape[1])
+            if freq_feature_dim >= 3 and (freq_feature_dim - 1) % 2 == 0:
+                config['trunk_freq_num_bands'] = (freq_feature_dim - 1) // 2
+    else:
+        config['use_trunk_freq_encoding'] = False
+
+    return config
 
 
 def load_model_checkpoint(model, model_path, device):
@@ -612,6 +688,22 @@ def test(args):
     if inferred_branch2 and inferred_branch2 != getattr(args, 'branch2_type', None):
         print(f'[*] 根据权重自动切换 branch2_type: {args.branch2_type} -> {inferred_branch2}')
         args.branch2_type = inferred_branch2
+    inferred_branch1 = infer_branch1_config_from_checkpoint(model_path, device)
+    for name, value in inferred_branch1.items():
+        if getattr(args, name, None) != value:
+            print(f'[*] 根据权重自动切换 {name}: {getattr(args, name, None)} -> {value}')
+            setattr(args, name, value)
+    if getattr(args, 'branch2_type', None) == 'fno':
+        inferred_branch2_fno = infer_branch2_fno_config_from_checkpoint(model_path, device)
+        for name, value in inferred_branch2_fno.items():
+            if getattr(args, name, None) != value:
+                print(f'[*] 根据权重自动切换 {name}: {getattr(args, name, None)} -> {value}')
+                setattr(args, name, value)
+    inferred_trunk = infer_trunk_config_from_checkpoint(model_path, device)
+    for name, value in inferred_trunk.items():
+        if getattr(args, name, None) != value:
+            print(f'[*] 根据权重自动切换 {name}: {getattr(args, name, None)} -> {value}')
+            setattr(args, name, value)
 
     model = Pi_DeepONet(args).to(device)
     fno = FNO(args).to(device)

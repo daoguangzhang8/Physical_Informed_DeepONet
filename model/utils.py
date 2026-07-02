@@ -1,4 +1,4 @@
-
+import math
 
 from Labconfig import *
 from torch.optim.lr_scheduler import _LRScheduler
@@ -105,6 +105,24 @@ def count_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())
     return total_params
 
+
+def cosine_pde_weight(args, epoch, target_weight=None):
+    """Smoothly ramp PDE loss weight from its initial value to the target."""
+    if target_weight is None:
+        target_weight = getattr(args, 'b', 1.0)
+    target_weight = float(target_weight)
+    if not getattr(args, 'use_pde_weight_ramp', False):
+        return target_weight
+
+    start_weight = float(getattr(args, 'pde_start_weight', target_weight))
+    ramp_epochs = max(0, int(getattr(args, 'pde_ramp_epochs', 0)))
+    if ramp_epochs == 0:
+        return target_weight
+
+    progress = min(max(float(epoch) / ramp_epochs, 0.0), 1.0)
+    cosine_progress = 0.5 * (1.0 - math.cos(math.pi * progress))
+    return start_weight + (target_weight - start_weight) * cosine_progress
+
 # ==========================================
 # 单机多卡并行训练工具函数 (Single-Machine Multi-GPU)
 # ==========================================
@@ -120,13 +138,15 @@ def setup_distributed(rank, world_size, local_device=None):
     os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
     os.environ.setdefault('MASTER_PORT', '29500')
 
-    # 初始化进程组 (单机固定使用 nccl 后端)
-    dist.init_process_group('nccl', rank=rank, world_size=world_size)
-
-    # 设置当前设备
     if local_device is None:
         local_device = rank
+
+    # 先绑定当前进程可见 GPU，再初始化 NCCL。否则 selected_gpus 非连续时，
+    # NCCL 的首次 barrier 可能错误地回退到逻辑 rank 对应的 GPU。
     torch.cuda.set_device(local_device)
+
+    # 初始化进程组 (单机固定使用 nccl 后端)
+    dist.init_process_group('nccl', rank=rank, world_size=world_size)
 
     print(f"[Rank {rank}] 单机多卡训练环境初始化完成 | GPU: {local_device} ({rank}/{world_size})")
 
@@ -412,6 +432,20 @@ def Halton_Sample(array_shape, num_samples):
     rows = np.clip(rows, 0, array_shape[0]-1)
     cols = np.clip(cols, 0, array_shape[1]-1)
     return list(zip(rows, cols))
+
+
+def make_sobol_engine(seed=0):
+    """Create a persistent scrambled Sobol sequence for spatial grid sampling."""
+    return torch.quasirandom.SobolEngine(dimension=2, scramble=True, seed=int(seed))
+
+
+def draw_sobol_grid_points(engine, num_pts, nz, nx, dh, device):
+    """Draw Sobol points and quantize them to label-aligned physical grid coordinates."""
+    grid_shape = torch.tensor([nz, nx], dtype=torch.float32)
+    grid_indices = torch.floor(engine.draw(int(num_pts)) * grid_shape)
+    grid_indices[:, 0].clamp_(0, nz - 1)
+    grid_indices[:, 1].clamp_(0, nx - 1)
+    return (grid_indices * float(dh)).to(device)
 
 
 def generate_random_points(batch_size, n_pts, range_max=None):
